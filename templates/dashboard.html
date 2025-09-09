@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>AI Assistant Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.4.1/socket.io.js"></script>
+</head>
+<body>
+
+    <div>
+        <a href="/settings">⚙️ Agent Settings</a>
+    </div>
+
+    <h1>📡 iMessage Bot</h1>
+
+    <h2>📩 Send Bulk Message</h2>
+    <form action="/send_bulk" method="post">
+        <label>Select Contacts:</label><br>
+        {% for phone, name in contacts.items() %}
+            <input type="checkbox" name="contacts" value="{{ phone }}"> {{ name }} ({{ phone }})<br>
+        {% endfor %}
+        <br>
+        <textarea name="message" placeholder="Enter message"></textarea>
+        <button type="submit">Send</button>
+    </form>
+
+    <h2>⏳ Schedule a Message</h2>
+    <form action="/schedule_message" method="post">
+        <label>Select Contacts:</label><br>
+        {% for phone, name in contacts.items() %}
+            <input type="checkbox" name="contacts" value="{{ phone }}"> {{ name }} ({{ phone }})<br>
+        {% endfor %}
+        <br>
+        <input type="time" name="time">
+        <textarea name="message" placeholder="Enter message"></textarea>
+        <button type="submit">Schedule</button>
+    </form>
+    <!-- Legacy AI settings removed; manage allowlist and trigger under Agent Settings page. -->
+
+    <h2>📩 Real-Time Messages</h2>
+    <ul id="messages"></ul>
+
+    <h2>📊 AI Response Log</h2>
+    <ul id="analytics"></ul>
+
+    <script>
+        var socket = io();
+
+        // Listen for messages that are sent
+        socket.on("message_sent", function(data) {
+            console.log("✅ Message Sent:", data);
+            var ctx = data.chat_type ? (data.chat_type === 'Group' ? ' [Group]' : ' [Direct]') : '';
+            var toLabel = data.chat_type === 'Group' && data.chat_guid ? data.chat_guid : data.phone;
+            var item = document.createElement("li");
+            item.innerHTML = `✅ <strong>Sent to ${toLabel}${ctx}:</strong> ${data.message}`;
+            document.getElementById("messages").appendChild(item);
+        });
+
+        // Listen for new incoming messages
+        socket.on("new_message", function(data) {
+            console.log("📩 New Message:", data);
+            var ctx = data.chat_type ? (data.chat_type === 'Group' ? ' [Group]' : ' [Direct]') : '';
+            var fromLabel = data.chat_type === 'Group' && data.chat_guid ? `${data.phone} | ${data.chat_guid}` : data.phone;
+            var msgItem = document.createElement("li");
+            msgItem.innerHTML = `📩 <strong>From ${fromLabel}${ctx}:</strong> ${data.message}`;
+            document.getElementById("messages").appendChild(msgItem);
+
+            if (data.response) {
+                var aiItem = document.createElement("li");
+                aiItem.innerHTML = `🤖 <strong>AI Reply:</strong> ${data.response}`;
+                document.getElementById("analytics").appendChild(aiItem);
+            }
+        });
+
+        // Handle errors
+        socket.on("connect_error", function(error) {
+            console.error("❌ WebSocket Connection Error:", error);
+        });
+    </script>
+
+</body>
+</html>
