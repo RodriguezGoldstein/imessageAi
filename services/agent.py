@@ -16,6 +16,7 @@ import base64
 import mimetypes
 from cryptography.fernet import Fernet
 from tavily import TavilyClient
+from collections import defaultdict, deque
 
 
 # OpenAI API Key (env only)
@@ -79,6 +80,25 @@ message_log = []
 
 # Scheduled messages (phone, time, message)
 scheduled_messages = []
+
+# Track recent messages we sent (to avoid treating them as user triggers)
+_recent_sends = defaultdict(lambda: deque(maxlen=20))  # key -> deque[(text, ts)]
+
+def _record_sent(key: str, text: str):
+    try:
+        _recent_sends[key].append((text or "", time.time()))
+    except Exception:
+        pass
+
+def _was_recently_sent_by_bot(key: str, text: str, window_secs: int = 30) -> bool:
+    try:
+        now = time.time()
+        for t, ts in list(_recent_sends.get(key, [])):
+            if t == (text or "") and (now - ts) <= max(1, window_secs):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 # Default settings (minimal)
@@ -291,6 +311,13 @@ def send_message(message: str, phone_number: str = None, chat_guid: str = None):
 
     # Log sent message
     log_message(emit_phone, message, "Sent")
+    # Record for self-trigger discrimination (use chat_guid if available, else phone)
+    try:
+        key = safe_chat_guid or emit_phone or target_desc
+        if key:
+            _record_sent(key, message)
+    except Exception:
+        pass
     if socketio:
         payload = {"phone": emit_phone, "message": message}
         payload.update(emit_ctx)
@@ -1512,18 +1539,27 @@ def monitor_db_polling_general():
             if socketio:
                 socketio.emit("new_message", {"phone": phone_number, "message": message, "chat_type": chat_type, "chat_guid": chat_guid})
 
-            # Only react to inbound messages (not our own sends)
+            # Check trigger first
+            cmd = extract_trigger_command(message, ai_settings.get("ai_trigger_tag", "@ai"))
+            if not cmd:
+                continue
+            print(f"🔎 Trigger detected. Sender={phone_number} Cmd='{cmd}' chat_type={chat_type} chat_guid={chat_guid}")
+
+            # Determine allowance
+            key_for_recent = chat_guid or phone_number
             if is_from_me:
+                # Allow manual commands typed by the device owner, but ignore echoes of our own bot sends
+                if _was_recently_sent_by_bot(key_for_recent, message):
+                    continue
+                allowed = True
+            else:
+                allowed = phone_number in ai_settings.get("allowed_users", [])
+
+            if not allowed:
+                print(f"⛔ Ignoring trigger: sender not in allowlist. Allowed={ai_settings.get('allowed_users', [])}")
                 continue
 
-            # Check trigger and allowlist
-            cmd = extract_trigger_command(message, ai_settings.get("ai_trigger_tag", "@ai"))
-            if cmd:
-                print(f"🔎 Trigger detected. Sender={phone_number} Cmd='{cmd}' chat_type={chat_type} chat_guid={chat_guid}")
-            allowed = phone_number in ai_settings.get("allowed_users", [])
-            if not allowed and cmd:
-                print(f"⛔ Ignoring trigger: sender not in allowlist. Allowed={ai_settings.get('allowed_users', [])}")
-            if allowed and cmd:
+            if allowed:
                 try:
                     emit_ctx = {"phone": phone_number, "chat_type": chat_type, "chat_guid": chat_guid}
                     # If the request seems to be about an image or a PDF, try specialized handlers
