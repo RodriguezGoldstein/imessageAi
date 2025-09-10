@@ -18,7 +18,12 @@
     </head>
 <body>
     <div class="container">
-        <div><a href="/">← Back to Dashboard</a></div>
+        <div>
+            <a href="/">← Back to Dashboard</a>
+            <form action="/logout" method="post" style="display:inline; float:right;">
+                <button type="submit">Log out</button>
+            </form>
+        </div>
         <h1>⚙️ Agent Settings</h1>
 
         <div class="section">
@@ -35,16 +40,8 @@
             <h2>Allowed Users</h2>
             <form action="/update_ai_settings" method="post">
                 <div>
-                    {% for phone, name in contacts.items() %}
-                        <label>
-                            <input type="checkbox" name="allowed_users" value="{{ phone }}" {% if phone in ai_settings.get('allowed_users', []) %}checked{% endif %}>
-                            {{ name }} ({{ phone }})
-                        </label>
-                    {% endfor %}
-                </div>
-                <div>
-                    <label>Additional Allowed Users (one per line or comma-separated):</label>
-                    <textarea name="allowed_users_extra" rows="3" placeholder="+11234567890, +10987654321"></textarea>
+                    <label>Add or update allowed users (phone or email). Comma or newline separated:</label>
+                    <textarea name="allowed_users_extra" rows="4" placeholder="+11234567890, +10987654321"></textarea>
                 </div>
                 <button type="submit">Save Allowlist</button>
             </form>
@@ -66,4 +63,3 @@
     </div>
 </body>
 </html>
-

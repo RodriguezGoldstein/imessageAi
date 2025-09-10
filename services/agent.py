@@ -9,6 +9,8 @@ from flask_socketio import SocketIO
 from openai import OpenAI
 import typedstream
 import csv
+from pathlib import Path
+from cryptography.fernet import Fernet
 
 
 # OpenAI API Key (env only)
@@ -17,6 +19,10 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
 
 # macOS iMessage database path
 CHAT_DB = os.path.expanduser("~/Library/Messages/chat.db")
+
+# App support/state path (persist last_seen_date)
+APP_SUPPORT_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "imessage-ai")
+STATE_FILE = os.path.join(APP_SUPPORT_DIR, "state.json")
 
 # Flask SocketIO instance
 socketio = None
@@ -27,14 +33,38 @@ last_seen_date = 0
 # Load AI settings from JSON
 SETTINGS_FILE = "settings.json"
 
-# Load contacts from CSV
-CONTACTS_FILE = "contacts.csv"
-
+# Contacts no longer sourced from CSV; keep an empty map for display/logging.
 contacts = {}
-with open(CONTACTS_FILE, mode='r') as file:
-    csv_reader = csv.DictReader(file)
-    for row in csv_reader:
-        contacts[row['phone']] = row['name']
+
+def normalize_phone(s: str) -> str:
+    """Normalize a phone number to a consistent form. Removes common punctuation and 'tel:' prefix.
+    Preserves leading '+' if present. Returns digits (and optional leading '+')."""
+    if not s:
+        return ""
+    s = str(s).strip()
+    if s.lower().startswith("tel:"):
+        s = s[4:]
+    # Keep leading '+' if present, strip all non-digits otherwise
+    lead_plus = s.startswith('+')
+    digits = ''.join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return ""
+    return ('+' if lead_plus else '') + digits
+
+
+def normalize_handle(addr: str) -> str:
+    """Normalize an iMessage handle id. If it looks like email, lower-case it; else treat as phone."""
+    if not addr:
+        return ""
+    a = str(addr).strip()
+    if '@' in a:
+        return a.lower()
+    return normalize_phone(a)
+
+
+def _load_contacts_safe():
+    # Deprecated: contacts.csv removed; return empty
+    return {}
 
 # Track replies and analytics
 message_log = []
@@ -50,16 +80,144 @@ if os.path.exists(SETTINGS_FILE):
 else:
     ai_settings = {}
 
+# Encryption helpers for allowlist at rest
+KEY_FILE = os.path.join(APP_SUPPORT_DIR, "secret.key")
+
+
+def _get_or_create_key() -> bytes:
+    _ensure_app_support_dir()
+    try:
+        if os.path.exists(KEY_FILE):
+            with open(KEY_FILE, 'rb') as f:
+                return f.read()
+    except Exception as e:
+        print(f"⚠️ Failed reading key: {e}")
+    key = Fernet.generate_key()
+    try:
+        with open(KEY_FILE, 'wb') as f:
+            f.write(key)
+    except Exception as e:
+        print(f"⚠️ Failed writing key file: {e}")
+    return key
+
+
+def _fernet() -> Fernet:
+    return Fernet(_get_or_create_key())
+
+
+def encrypt_list(items: list[str]) -> list[str]:
+    f = _fernet()
+    out = []
+    for it in items or []:
+        if not it:
+            continue
+        token = f.encrypt(it.encode('utf-8')).decode('utf-8')
+        out.append(token)
+    return out
+
+
+def decrypt_list(tokens: list[str]) -> list[str]:
+    f = _fernet()
+    out = []
+    for tok in tokens or []:
+        if not tok:
+            continue
+        try:
+            val = f.decrypt(tok.encode('utf-8')).decode('utf-8')
+            out.append(val)
+        except Exception:
+            continue
+    return out
+
+
 # Ensure generalized agent settings exist
 if "ai_trigger_tag" not in ai_settings:
     ai_settings["ai_trigger_tag"] = "@ai"
-if "allowed_users" not in ai_settings:
+if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
+    # Decrypt into memory for runtime use
     try:
-        ai_settings["allowed_users"] = list(contacts.keys())
+        allowed_plain = decrypt_list(ai_settings.get("allowed_users_encrypted", []))
+        ai_settings["allowed_users"] = sorted({normalize_handle(x) for x in allowed_plain if x})
     except Exception:
         ai_settings["allowed_users"] = []
-    with open(SETTINGS_FILE, "w") as file:
-        json.dump(ai_settings, file, indent=4)
+elif "allowed_users" not in ai_settings:
+    ai_settings["allowed_users"] = []
+    # Persist initial encrypted state
+    try:
+        with open(SETTINGS_FILE, "w") as file:
+            json.dump({
+                **ai_settings,
+                "allowed_users_encrypted": encrypt_list(ai_settings.get("allowed_users", [])),
+                "allowed_users": []  # do not persist plaintext
+            }, file, indent=4)
+    except Exception:
+        pass
+
+"""Normalize existing allowlist on load (plaintext in memory only)."""
+if isinstance(ai_settings.get("allowed_users"), list):
+    ai_settings["allowed_users"] = sorted({normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x})
+
+
+def _ensure_app_support_dir():
+    try:
+        Path(APP_SUPPORT_DIR).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ Could not create app support dir: {e}")
+
+
+def _load_state():
+    global last_seen_date
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+                last_seen_date = int(data.get('last_seen_date', 0))
+    except Exception as e:
+        print(f"⚠️ Failed to load state: {e}")
+
+
+def _save_state():
+    try:
+        _ensure_app_support_dir()
+        with open(STATE_FILE, 'w') as f:
+            json.dump({"last_seen_date": last_seen_date}, f)
+    except Exception as e:
+        print(f"⚠️ Failed to save state: {e}")
+
+
+def _init_last_seen_if_needed():
+    """If last_seen_date is 0, initialize to latest DB message date unless BOT_REPLAY_HISTORY=1."""
+    global last_seen_date
+    if last_seen_date:
+        return
+    if os.getenv("BOT_REPLAY_HISTORY", "0") == "1":
+        return
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(date), 0) FROM message")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            last_seen_date = int(row[0])
+            _save_state()
+    except Exception as e:
+        # If we cannot read DB (permissions), leave at 0; monitor will handle errors
+        print(f"⚠️ Could not init last_seen_date from DB: {e}")
+
+
+def escape_applescript(s: str) -> str:
+    """Escape a string for safe inclusion inside an AppleScript string literal."""
+    if s is None:
+        return ""
+    # Escape backslash first, then quotes; replace newlines and carriage returns
+    return (
+        str(s)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
 
 
 ### 📌 Function: Send iMessage (individual or group) ###
@@ -67,27 +225,30 @@ def send_message(message: str, phone_number: str = None, chat_guid: str = None):
     """Sends an iMessage. If chat_guid is provided, sends to that chat (group). Otherwise sends to buddy by phone."""
     if not message:
         return
+    safe_message = escape_applescript(message)
+    safe_phone = escape_applescript(phone_number) if phone_number else None
+    safe_chat_guid = escape_applescript(chat_guid) if chat_guid else None
     if chat_guid:
         script = f'''
         tell application "Messages"
-            set theChat to a reference to chat id "{chat_guid}"
-            send "{message}" to theChat
+            set theChat to a reference to chat id "{safe_chat_guid}"
+            send "{safe_message}" to theChat
         end tell
         '''
-        target_desc = f"chat {chat_guid}"
+        target_desc = f"chat {safe_chat_guid}"
         emit_phone = phone_number or chat_guid
-        emit_ctx = {"chat_type": "Group", "chat_guid": chat_guid}
+        emit_ctx = {"chat_type": "Group", "chat_guid": safe_chat_guid}
     else:
         if not phone_number:
             return
         script = f'''
         tell application "Messages"
             set targetService to 1st account whose service type = iMessage
-            set targetBuddy to buddy "{phone_number}" of targetService
-            send "{message}" to targetBuddy
+            set targetBuddy to buddy "{safe_phone}" of targetService
+            send "{safe_message}" to targetBuddy
         end tell
         '''
-        target_desc = phone_number
+        target_desc = safe_phone
         emit_phone = phone_number
         emit_ctx = {"chat_type": "Individual", "chat_guid": None}
 
@@ -107,15 +268,25 @@ def send_message(message: str, phone_number: str = None, chat_guid: str = None):
 
 # Backwards-compat wrapper
 def send_imessage(phone_number, message):
-    return send_message(message=message, phone_number=phone_number)
+    return send_message(message=message, phone_number=normalize_phone(phone_number))
 
 
 ### 📌 Function: Fetch New iMessages (general) ###
 def fetch_new_messages_all():
     """Fetch new received messages (individual chats) since the last seen date."""
     global last_seen_date
-    conn = sqlite3.connect(CHAT_DB)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cursor = conn.cursor()
+    except sqlite3.OperationalError as e:
+        msg = (
+            "Cannot open Messages database. Grant Full Disk Access to your Python interpreter/terminal/editor "
+            "in System Settings → Privacy & Security → Full Disk Access."
+        )
+        print(f"❌ DB open error: {e}")
+        if socketio:
+            socketio.emit("agent_error", {"type": "db_open", "error": str(e), "hint": msg})
+        return []
 
     cursor.execute(
         """
@@ -151,8 +322,10 @@ def fetch_new_messages_all():
         (last_seen_date,)
     )
 
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
 
     messages = []
     for (message_id, message_group, chat_guid, chat_type, is_from_me, address, date_raw, attributedBody, service) in rows:
@@ -164,6 +337,7 @@ def fetch_new_messages_all():
 
         if date_raw and date_raw > last_seen_date:
             last_seen_date = date_raw
+            _save_state()
 
         messages.append({
             "message_id": message_id,
@@ -188,7 +362,8 @@ def log_message(phone, message, direction):
         "message": message,
         "direction": direction
     })
-    socketio.emit("update_analytics", message_log)
+    if socketio:
+        socketio.emit("update_analytics", message_log)
 
 
 ### Legacy monitors removed in favor of generalized @ai trigger monitor
@@ -203,8 +378,16 @@ def schedule_messages():
         
 
 def save_ai_settings():
+    # Normalize and persist encrypted allowlist; do not write plaintext to disk
+    allowed_plain = []
+    if isinstance(ai_settings.get("allowed_users"), list):
+        allowed_plain = sorted({normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x})
+        ai_settings["allowed_users"] = allowed_plain
+    payload = {**ai_settings}
+    payload["allowed_users_encrypted"] = encrypt_list(allowed_plain)
+    payload["allowed_users"] = []
     with open(SETTINGS_FILE, "w") as file:
-        json.dump(ai_settings, file, indent=4)
+        json.dump(payload, file, indent=4)
 
 
 ### 📌 Helper: Extract @ai command ###
@@ -238,11 +421,17 @@ def monitor_db_polling_general():
     """Polls for new messages and reacts only to @ai triggers from allowed users."""
     print("🔍 General monitor: polling chat.db for new messages every 5 seconds...")
 
+    # Initialize last_seen_date from persisted state/DB
+    _ensure_app_support_dir()
+    _load_state()
+    _init_last_seen_if_needed()
+
     while True:
         new_items = fetch_new_messages_all()
 
         for item in new_items:
-            phone_number = item.get("address")
+            phone_number_raw = item.get("address")
+            phone_number = normalize_handle(phone_number_raw)
             message = item.get("text", "")
             chat_guid = item.get("chat_guid")
             chat_type = item.get("chat_type")
@@ -282,3 +471,16 @@ def monitor_db_polling_general():
                         })
 
         time.sleep(5)
+
+
+def check_db_reachability():
+    """Return (ok, error_message)."""
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)

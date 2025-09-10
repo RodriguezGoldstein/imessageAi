@@ -20,12 +20,11 @@ This project is focused on privacy and explicit control: the agent never auto-re
 
 ## Architecture
 
-- Backend: Flask + Flask-SocketIO (`eventlet`) for real-time updates.
+- Backend: Flask + Flask-SocketIO (threading mode) for real-time updates.
 - Agent core: `services/agent.py` polls `~/Library/Messages/chat.db` for new messages and sends replies with AppleScript.
 - UI: `templates/dashboard.html` for live feed; `templates/settings.html` for trigger + allowlist management.
 - Data:
-  - `contacts.csv` (name, phone) – your address book for bulk/scheduled sends and allowlist convenience.
-  - `settings.json` – stores `ai_trigger_tag` and `allowed_users`.
+  - `settings.json` – stores `ai_trigger_tag` and the allowlist (encrypted at rest).
 
 ## Requirements
 
@@ -40,8 +39,21 @@ This project is focused on privacy and explicit control: the agent never auto-re
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt  # pinned versions
 ```
+
+Or via Make:
+
+```bash
+make setup
+```
+
+Guided installer:
+
+```bash
+bash scripts/install.sh
+```
+Walks you through dependency install, permissions, secrets, and either runs locally or installs a launchd service.
 
 ## Configure
 
@@ -53,17 +65,28 @@ export OPENAI_KEY=sk-...
 export OPENAI_API_KEY=sk-...
 ```
 
-2) Contacts file (optional but recommended)
+2) Local auth token (recommended)
 
-Edit `contacts.csv`:
+Set a local bearer token to protect the dashboard and write endpoints:
 
-```
-name,phone
-Alice,+11234567890
-Bob,+10987654321
+```bash
+export IMSG_AI_TOKEN=choose-a-strong-token
 ```
 
-3) Settings (auto-created if missing)
+UI login: visit `http://127.0.0.1:5000/login` and enter the token. After login, the browser stays authenticated via a session cookie. For API calls, send `Authorization: Bearer <token>`.
+
+3) Session secret (recommended)
+
+Set a secret for signing the session cookie:
+
+```bash
+export IMSG_AI_SECRET=$(python - <<'PY'
+import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+PY
+)
+```
+
+4) Settings (auto-created if missing)
 
 `settings.json`
 
@@ -88,7 +111,26 @@ Full agent (polling + replies):
 
 ```bash
 python app.py
-# Visit http://127.0.0.1:5000/
+# Visit http://127.0.0.1:5000/ (you will be redirected to /login if a token is set)
+```
+
+Using Make:
+
+```bash
+make run         # full agent
+make run-ui      # UI only (no DB polling)
+```
+
+Using the generated helper after installer:
+
+```bash
+scripts/run_local.sh
+```
+
+Stop a background (nohup) run:
+
+```bash
+bash scripts/stop_background.sh
 ```
 
 From an allowed number, send in any thread:
@@ -103,21 +145,78 @@ The agent replies in the same direct chat or group.
 
 - GET `/allowlist` → `{ ai_trigger_tag, allowed_users, contacts }`
 - POST `/allowlist` (JSON) → update `ai_trigger_tag` and `allowed_users`
+- GET `/healthz` → `{ ok, db_ok, db_error, last_seen_date }`
 
-Example:
+Programmatic send:
+
+- POST `/api/send` (JSON)
+  - Body: `{ "phone": "+15555555555", "message": "Hello" }` OR `{ "chat_guid": "iMessage;+15555555555;12345", "message": "Hello group" }`
+  - Auth: `Authorization: Bearer $IMSG_AI_TOKEN`
+
+Example (authorized):
 
 ```bash
 curl -X POST http://127.0.0.1:5000/allowlist \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $IMSG_AI_TOKEN" \
   -d '{"ai_trigger_tag":"@ai","allowed_users":["+15555555555"]}'
+```
+
+Send a message to a phone:
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/send \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $IMSG_AI_TOKEN" \
+  -d '{"phone":"+15555555555","message":"Hello from API"}'
+```
+
+Send a message to a specific chat (group) by GUID:
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/send \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $IMSG_AI_TOKEN" \
+  -d '{"chat_guid":"iMessage;+15555555555;12345","message":"Hello group"}'
 ```
 
 ## Dashboard
 
 - Real-time list of received messages and bot replies (with [Group]/[Direct] indicator; group shows `chat_guid`).
-- Bulk send to checked contacts.
-- Schedule a message for a time of day.
+- Bulk send: paste phone numbers (comma/newline separated) and a message.
+- Schedule a message for a time of day to pasted numbers.
 - Link to Settings page for trigger and allowlist.
+
+## Service Setup (launchd)
+
+The app can run at login under launchd.
+
+1) Ensure the virtualenv is installed:
+
+```bash
+make setup
+```
+
+2) Install the launch agent (uses your current repo path and venv):
+
+```bash
+OPENAI_API_KEY=sk-... IMSG_AI_TOKEN=choose-a-strong-token IMSG_AI_SECRET=... make install-service
+```
+
+3) Logs:
+
+```bash
+make logs
+```
+
+4) Uninstall:
+
+```bash
+make uninstall-service
+bash scripts/uninstall.sh     # guided full uninstall (agent, state, logs, venv)
+```
+
+If DB errors appear, grant Full Disk Access to your terminal/python and allow Automation for controlling Messages.
 
 ## Notes and Limitations
 
@@ -127,12 +226,40 @@ curl -X POST http://127.0.0.1:5000/allowlist \
 - The Messages DB format can change with macOS updates; SQL may need adjustments.
 - Ensure Full Disk Access; otherwise reads from `chat.db` will fail.
 - Ensure Automation permission; otherwise AppleScript won’t send messages.
+- Persists `last_seen_date` under `~/Library/Application Support/imessage-ai/state.json` to avoid replaying history; set `BOT_REPLAY_HISTORY=1` to process existing messages.
+- Phone normalization: The app normalizes phones by stripping punctuation and a leading `tel:` prefix, preserving a leading `+` if present (e.g., `tel:+1 (555) 123-4567` → `+15551234567`). Email handles are lower‑cased.
+- Allowlist privacy: Phone numbers/emails in the allowlist are encrypted at rest in `settings.json`. A key is stored under `~/Library/Application Support/imessage-ai/secret.key`.
+
+## macOS Permissions Helper
+
+Run:
+
+```bash
+make macos-setup
+```
+
+It opens the relevant System Settings panes and triggers a harmless prompt to help you grant permissions.
 
 ## Privacy & Security
 
 - Only messages containing your trigger from allowed numbers are sent to OpenAI.
 - The agent does not auto-respond outside explicit `@ai` commands.
 - Logs are local and ephemeral (in-memory for the session’s dashboard feed).
+- Local auth protects all pages and write endpoints; login at `/login` uses a session cookie signed with `IMSG_AI_SECRET`.
+- WebSocket connections are token/session protected and Socket.IO CORS is restricted to `localhost`.
+
+## Make Targets
+
+```bash
+make setup             # create venv and install pinned deps
+make run               # run full agent
+make run-ui            # run UI only (no DB polling)
+make install-service   # install launchd agent (use env OPENAI_API_KEY, IMSG_AI_TOKEN, IMSG_AI_SECRET)
+make uninstall-service # remove launchd agent
+make logs              # tail service logs
+make doctor            # check env, dependencies, DB access, Automation
+make macos-setup       # open permissions panes and prompt
+```
 
 ## Project Layout
 
@@ -142,7 +269,6 @@ services/agent.py      # Agent: DB polling, AppleScript sending, @ai processing
 templates/
   dashboard.html       # Live feed and controls
   settings.html        # Trigger + allowlist management
-contacts.csv           # Your contacts for UI and allowlist convenience
 settings.json          # Persisted agent settings
 ```
 
@@ -154,6 +280,7 @@ settings.json          # Persisted agent settings
   - `OPENAI_KEY`/`OPENAI_API_KEY` is set.
   - App has Full Disk Access and Automation permissions.
   - Console logs for AppleScript errors.
+  - `make doctor` for quick environment and permissions checks.
 
 ---
 
