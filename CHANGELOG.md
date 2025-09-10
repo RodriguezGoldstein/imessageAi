@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.1 — 2025-09-10
+
+Added:
+- Configurable `context_window` setting (default 25) controlling how many recent messages are included as context for `@ai` replies.
+- Settings UI field for context window (1–100) and exposure via GET `/allowlist`.
+
+Changed:
+- Model input now includes formatted conversation history for the current chat (up to `context_window`) plus the user’s `@ai` request.
+- README updated to document the context window feature and example settings.
+
 ## v0.3.0 — 2025-09-10
 
 Highlights:
