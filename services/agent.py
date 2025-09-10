@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import time
 import schedule
+import re
 from datetime import datetime
 from flask_socketio import SocketIO
 from openai import OpenAI
@@ -455,13 +456,22 @@ def save_ai_settings():
 
 ### 📌 Helper: Extract @ai command ###
 def extract_trigger_command(text: str, tag: str = "@ai") -> str:
-    """Extract and return the command text following the trigger tag, if present."""
+    """Extract and return the command text following the trigger tag, if present.
+
+    Robust to minor variations like '@ ai', fullwidth at-sign '＠', and stray formatting chars.
+    """
     if not text or not tag:
         return ""
-    idx = text.lower().find(tag.lower())
-    if idx == -1:
-        return ""
-    return text[idx + len(tag):].strip(" :\n\t\r")
+    s = text or ""
+    # Direct substring search first (fast path)
+    idx = s.lower().find(tag.lower())
+    if idx != -1:
+        return s[idx + len(tag):].strip(" :\n\t\r")
+    # Fallback: allow optional whitespace after '@', and fullwidth AT
+    m = re.search(r"[@＠]\s*ai\b", s, re.IGNORECASE)
+    if m:
+        return s[m.end():].strip(" :\n\t\r")
+    return ""
 
 
 ### 📌 Helper: Query OpenAI directly with a command ###
@@ -1539,8 +1549,15 @@ def monitor_db_polling_general():
             if socketio:
                 socketio.emit("new_message", {"phone": phone_number, "message": message, "chat_type": chat_type, "chat_guid": chat_guid})
 
-            # Check trigger first
-            cmd = extract_trigger_command(message, ai_settings.get("ai_trigger_tag", "@ai"))
+            # Check trigger first, with debug when message contains '@'
+            tag = ai_settings.get("ai_trigger_tag", "@ai")
+            if "@" in (message or ""):
+                try:
+                    pos_dbg = (message or "").lower().find((tag or "").lower())
+                    print(f"🧪 tag='{tag}' pos={pos_dbg} msg={repr(message[:120])}...")
+                except Exception:
+                    pass
+            cmd = extract_trigger_command(message, tag)
             if not cmd:
                 continue
             print(f"🔎 Trigger detected. Sender={phone_number} Cmd='{cmd}' chat_type={chat_type} chat_guid={chat_guid}")
