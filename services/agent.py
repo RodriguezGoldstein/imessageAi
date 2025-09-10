@@ -7,6 +7,7 @@ import schedule
 from datetime import datetime
 from flask_socketio import SocketIO
 from openai import OpenAI
+from typing import List, Dict, Tuple, Optional, Any
 import typedstream
 import csv
 from pathlib import Path
@@ -41,7 +42,7 @@ SETTINGS_FILE = "settings.json"
 # Contacts no longer sourced from CSV; keep an empty map for display/logging.
 contacts = {}
 # Cache of handle -> display name from Contacts
-_contact_name_cache: dict[str, str] = {}
+_contact_name_cache = {}
 
 def normalize_phone(s: str) -> str:
     """Normalize a phone number to a consistent form. Removes common punctuation and 'tel:' prefix.
@@ -112,7 +113,7 @@ def _fernet() -> Fernet:
     return Fernet(_get_or_create_key())
 
 
-def encrypt_list(items: list[str]) -> list[str]:
+def encrypt_list(items: List[str]) -> List[str]:
     f = _fernet()
     out = []
     for it in items or []:
@@ -123,7 +124,7 @@ def encrypt_list(items: list[str]) -> list[str]:
     return out
 
 
-def decrypt_list(tokens: list[str]) -> list[str]:
+def decrypt_list(tokens: List[str]) -> List[str]:
     f = _fernet()
     out = []
     for tok in tokens or []:
@@ -157,7 +158,7 @@ if "search_cache_ttl" not in ai_settings:
     ai_settings["search_cache_ttl"] = 120
 
 # In-memory cache for web search results: { (normalized_query, k): (ts, results) }
-_search_cache: dict[tuple[str, int], tuple[float, list[dict]]] = {}
+_search_cache = {}
 if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
     # Decrypt into memory for runtime use
     try:
@@ -490,7 +491,7 @@ def query_openai_direct(command: str) -> str:
             return f"Error: {e}"
 
 
-def _fetch_recent_messages_for_chat(chat_guid: str, limit: int = 10) -> list[dict]:
+def _fetch_recent_messages_for_chat(chat_guid: str, limit: int = 10) -> List[dict]:
     """Return last N messages for a chat GUID (most recent first in DB, returned oldest→newest)."""
     if not chat_guid:
         return []
@@ -532,7 +533,7 @@ def _fetch_recent_messages_for_chat(chat_guid: str, limit: int = 10) -> list[dic
     return out
 
 
-def _format_context_for_model(history: list[dict], requester: str | None, limit: int) -> str:
+def _format_context_for_model(history: List[dict], requester: Optional[str], limit: int) -> str:
     """Format recent messages as readable context for the model."""
     lines = [f"Conversation history (latest {int(limit)} messages):"]
     for item in history or []:
@@ -548,7 +549,7 @@ def _format_context_for_model(history: list[dict], requester: str | None, limit:
     return "\n".join(lines)
 
 
-def _lookup_contact_name_via_contacts_app(handle: str) -> str | None:
+def _lookup_contact_name_via_contacts_app(handle: str) -> Optional[str]:
     """Best-effort lookup of a display name for a phone/email using Contacts via AppleScript.
 
     Caches results to avoid repeated AppleScript calls. Returns None if not found or on error.
@@ -617,7 +618,7 @@ def _lookup_contact_name_via_contacts_app(handle: str) -> str | None:
     return None
 
 
-def _get_chat_participants(chat_guid: str) -> list[dict]:
+def _get_chat_participants(chat_guid: str) -> List[dict]:
     """Return a list of participants for a chat with optional contact names.
 
     Each item: {"handle": str, "name": str or None}
@@ -655,7 +656,7 @@ def _get_chat_participants(chat_guid: str) -> list[dict]:
     return out
 
 
-def _parse_name_mentions(cmd: str) -> list[str]:
+def _parse_name_mentions(cmd: str) -> List[str]:
     """Extract @name mentions (excluding '@ai') from a command string."""
     if not cmd:
         return []
@@ -663,13 +664,13 @@ def _parse_name_mentions(cmd: str) -> list[str]:
     parts = cmd.split()
     for p in parts:
         if p.startswith("@") and len(p) > 1:
-            tag = p[1:].strip(".,:;!?)"]).lower()
+            tag = p[1:].strip(".,:;!?)").lower()
             if tag and tag != "ai":
                 toks.append(tag)
     return toks
 
 
-def _resolve_mention_to_participant(chat_guid: str, mention: str) -> dict | None:
+def _resolve_mention_to_participant(chat_guid: str, mention: str) -> Optional[dict]:
     """Best-effort match of a mention like 'jon' to a chat participant by display name.
 
     Returns {"handle": str, "name": str or None} or None.
@@ -691,7 +692,7 @@ def _resolve_mention_to_participant(chat_guid: str, mention: str) -> dict | None
     return cand
 
 
-def _resolve_mentions_in_chat(chat_guid: str, mentions: list[str]) -> tuple[list[dict], dict, list[str]]:
+def _resolve_mentions_in_chat(chat_guid: str, mentions: List[str]) -> Tuple[List[dict], Dict, List[str]]:
     """Resolve a list of mentions to participants and fetch their latest messages.
 
     Returns (resolved, ambiguous, missing)
@@ -699,9 +700,9 @@ def _resolve_mentions_in_chat(chat_guid: str, mentions: list[str]) -> tuple[list
       - ambiguous: {mention: [candidates...]}, where candidate = {handle, name}
       - missing: list of mentions that did not match anyone
     """
-    resolved: list[dict] = []
-    ambiguous: dict[str, list[dict]] = {}
-    missing: list[str] = []
+    resolved = []
+    ambiguous = {}
+    missing = []
     if not (chat_guid and mentions):
         return resolved, ambiguous, missing
 
@@ -807,7 +808,7 @@ def web_search_cached(query: str, k: int) -> dict:
     return data
 
 
-def _maybe_force_search_query(cmd: str) -> str | None:
+def _maybe_force_search_query(cmd: str) -> Optional[str]:
     """Heuristics: if the command clearly asks for browsing/news/stocks, return a search query."""
     if not cmd:
         return None
@@ -834,7 +835,7 @@ def _maybe_force_search_query(cmd: str) -> str | None:
     return None
 
 
-def _is_image_row(uti: str | None, mime: str | None, filename: str | None) -> bool:
+def _is_image_row(uti: Optional[str], mime: Optional[str], filename: Optional[str]) -> bool:
     u = (uti or "").lower()
     m = (mime or "").lower()
     f = (filename or "").lower()
@@ -847,7 +848,7 @@ def _is_image_row(uti: str | None, mime: str | None, filename: str | None) -> bo
     return False
 
 
-def _is_pdf_row(uti: str | None, mime: str | None, filename: str | None) -> bool:
+def _is_pdf_row(uti: Optional[str], mime: Optional[str], filename: Optional[str]) -> bool:
     u = (uti or "").lower()
     m = (mime or "").lower()
     f = (filename or "").lower()
@@ -858,7 +859,7 @@ def _is_pdf_row(uti: str | None, mime: str | None, filename: str | None) -> bool
     return False
 
 
-def _find_recent_image_attachments(chat_guid: str, before_date: int | None = None, max_images: int = 3) -> list[str]:
+def _find_recent_image_attachments(chat_guid: str, before_date: Optional[int] = None, max_images: int = 3) -> List[str]:
     """Return up to max_images absolute file paths for recent image attachments in a chat."""
     if not chat_guid:
         return []
@@ -904,7 +905,7 @@ def _find_recent_image_attachments(chat_guid: str, before_date: int | None = Non
         except Exception:
             pass
 
-    paths: list[str] = []
+    paths = []
     for (filename, mime_type, uti, _date) in rows or []:
         if _is_image_row(uti, mime_type, filename) and filename:
             try:
@@ -919,7 +920,7 @@ def _find_recent_image_attachments(chat_guid: str, before_date: int | None = Non
     return paths
 
 
-def _find_recent_pdf_attachments(chat_guid: str, before_date: int | None = None, max_docs: int = 3) -> list[str]:
+def _find_recent_pdf_attachments(chat_guid: str, before_date: Optional[int] = None, max_docs: int = 3) -> List[str]:
     if not chat_guid:
         return []
     try:
@@ -964,7 +965,7 @@ def _find_recent_pdf_attachments(chat_guid: str, before_date: int | None = None,
         except Exception:
             pass
 
-    paths: list[str] = []
+    paths = []
     for (filename, mime_type, uti, _date) in rows or []:
         if _is_pdf_row(uti, mime_type, filename) and filename:
             try:
@@ -978,7 +979,7 @@ def _find_recent_pdf_attachments(chat_guid: str, before_date: int | None = None,
     return paths
 
 
-def _encode_image_as_data_url(path: str) -> str | None:
+def _encode_image_as_data_url(path: str) -> Optional[str]:
     """Return a data URL for an image. Converts unsupported formats (e.g., HEIC/TIFF) to JPEG via 'sips'."""
     try:
         allowed = {"image/png", "image/jpeg", "image/webp", "image/gif"}
@@ -1010,7 +1011,7 @@ def _encode_image_as_data_url(path: str) -> str | None:
         return None
 
 
-def describe_images_with_openai(image_paths: list[str], instruction: str | None = None) -> str:
+def describe_images_with_openai(image_paths: List[str], instruction: Optional[str] = None) -> str:
     """Call the OpenAI API with one or more images and return a concise description."""
     if not image_paths:
         return ""
@@ -1059,7 +1060,7 @@ def extract_text_from_pdf(path: str, max_chars: int = 30000) -> str:
         return ""
 
 
-def summarize_text_with_openai(text: str, instruction: str | None = None) -> str:
+def summarize_text_with_openai(text: str, instruction: Optional[str] = None) -> str:
     if not (text or "").strip():
         return ""
     ask = (instruction or "Give a concise summary (5-7 bullets or 1 short paragraph). Focus on the main points, claims, and any important numbers.").strip()
@@ -1076,7 +1077,7 @@ def summarize_text_with_openai(text: str, instruction: str | None = None) -> str
         return f"Error summarizing document: {e}"
 
 
-def _upload_file_to_openai(path: str) -> str | None:
+def _upload_file_to_openai(path: str) -> Optional[str]:
     try:
         with open(path, "rb") as f:
             fo = openai_client.files.create(file=f, purpose="assistants")
@@ -1086,7 +1087,7 @@ def _upload_file_to_openai(path: str) -> str | None:
         return None
 
 
-def summarize_pdfs_with_openai_file_refs(paths: list[str], instruction: str | None = None) -> str:
+def summarize_pdfs_with_openai_file_refs(paths: List[str], instruction: Optional[str] = None) -> str:
     """Upload one or more PDFs to OpenAI and request a concise summary using the Responses API.
 
     Falls back to local text extraction if the Responses API is unavailable or upload fails.
@@ -1198,7 +1199,7 @@ def _is_search_configured() -> bool:
     return bool(api_key)
 
 
-def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid: str | None = None, requester: str | None = None, extra_context: str | None = None) -> str:
+def query_openai_stream(command: str, emit_ctx: Optional[dict] = None, *, chat_guid: Optional[str] = None, requester: Optional[str] = None, extra_context: Optional[str] = None) -> str:
     """Stream a response via the Responses API and emit deltas over Socket.IO.
 
     Returns the final concatenated text.
@@ -1297,7 +1298,7 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
     input_text = "\n\n".join(p for p in parts if p).strip()
 
     ctx = dict(emit_ctx or {})
-    text_parts: list[str] = []
+    text_parts = []
     # Prefer Responses API streaming if available
     if hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
         try:
@@ -1325,7 +1326,7 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
                 instructions=system_prompt,
                 tools=tools or None,
             ) as stream:
-                tool_buffers: dict[str, dict] = {}
+                tool_buffers = {}
                 for event in stream:
                     try:
                         et = getattr(event, "type", "")
