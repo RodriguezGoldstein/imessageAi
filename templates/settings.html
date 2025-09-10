@@ -42,6 +42,17 @@
                 <label>Number of recent messages to include (1–100):
                     <input type="number" min="1" max="100" name="context_window" value="{{ ai_settings.get('context_window', 25) }}" />
                 </label>
+                <h3>Web Search (Google CSE)</h3>
+                <label>
+                    <input type="checkbox" name="enable_search" {% if ai_settings.get('enable_search', False) %}checked{% endif %} />
+                    Enable Google search tool (requires GOOGLE_API_KEY env)
+                </label>
+                <label>CSE ID (cx):
+                    <input type="text" name="google_cse_id" value="{{ ai_settings.get('google_cse_id', '') }}" placeholder="custom search engine id (cx)" />
+                </label>
+                <label>Max results per search (1–10):
+                    <input type="number" min="1" max="10" name="search_max_results" value="{{ ai_settings.get('search_max_results', 5) }}" />
+                </label>
                 <button type="submit">Save General Settings</button>
             </form>
         </div>

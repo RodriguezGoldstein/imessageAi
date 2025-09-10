@@ -11,6 +11,7 @@ import typedstream
 import csv
 from pathlib import Path
 from cryptography.fernet import Fernet
+import httpx
 
 
 # OpenAI API Key (env only)
@@ -140,6 +141,12 @@ if "system_prompt" not in ai_settings:
     ai_settings["system_prompt"] = "You are a concise, helpful assistant. Keep answers brief."
 if "context_window" not in ai_settings:
     ai_settings["context_window"] = 25
+if "enable_search" not in ai_settings:
+    ai_settings["enable_search"] = False
+if "google_cse_id" not in ai_settings:
+    ai_settings["google_cse_id"] = ""
+if "search_max_results" not in ai_settings:
+    ai_settings["search_max_results"] = 5
 if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
     # Decrypt into memory for runtime use
     try:
@@ -526,6 +533,35 @@ def _format_context_for_model(history: list[dict], requester: str | None, limit:
     return "\n".join(lines)
 
 
+def google_search(query: str, k: int = 5) -> list[dict]:
+    """Search Google Programmable Search (CSE) and return a list of results.
+
+    Requires env GOOGLE_API_KEY and settings ai_settings["google_cse_id"].
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_CSE_API_KEY")
+    cse_id = ai_settings.get("google_cse_id") or ""
+    if not api_key or not cse_id:
+        raise RuntimeError("Google Search not configured (set GOOGLE_API_KEY and google_cse_id in Settings)")
+    params = {"key": api_key, "cx": cse_id, "q": query, "num": max(1, min(int(k or 5), 10))}
+    try:
+        r = httpx.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in (data.get("items") or [])[: params["num"]]:
+            out.append({
+                "title": item.get("title"),
+                "url": item.get("link"),
+                "snippet": item.get("snippet") or "",
+            })
+        return out
+    except Exception as e:
+        raise RuntimeError(f"Google Search error: {e}")
+
+
 def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid: str | None = None, requester: str | None = None) -> str:
     """Stream a response via the Responses API and emit deltas over Socket.IO.
 
@@ -555,14 +591,36 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
     # Prefer Responses API streaming if available
     if hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
         try:
+            tools = None
+            enable_search = bool(ai_settings.get("enable_search"))
+            if enable_search:
+                tools = [{
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search the web for up-to-date information using Google Programmable Search",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "The search query"},
+                                "k": {"type": "integer", "minimum": 1, "maximum": 10, "default": int(ai_settings.get("search_max_results", 5))},
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                }]
+
             with openai_client.responses.stream(
                 model=model,
                 input=input_text,
                 instructions=system_prompt,
+                tools=tools or None,
             ) as stream:
+                tool_buffers: dict[str, dict] = {}
                 for event in stream:
                     try:
-                        if getattr(event, "type", "") == "response.output_text.delta":
+                        et = getattr(event, "type", "")
+                        if et == "response.output_text.delta":
                             delta = getattr(event, "delta", None)
                             if delta:
                                 text_parts.append(delta)
@@ -570,6 +628,45 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
                                     payload = {"delta": delta}
                                     payload.update(ctx)
                                     socketio.emit("ai_stream", payload)
+                        elif et.startswith("response.tool_call"):
+                            # Accumulate tool call arguments by id
+                            tid = getattr(event, "id", None) or getattr(event, "tool_call_id", None)
+                            name = getattr(event, "name", None)
+                            delta = getattr(event, "delta", None) or getattr(event, "arguments_delta", None) or getattr(event, "arguments", None)
+                            if tid:
+                                buf = tool_buffers.setdefault(tid, {"name": name, "args": ""})
+                                if name:
+                                    buf["name"] = name
+                                if isinstance(delta, str):
+                                    buf["args"] += delta
+                                elif isinstance(delta, dict):
+                                    try:
+                                        buf["args"] += json.dumps(delta)
+                                    except Exception:
+                                        pass
+                                # If tool call is complete, execute
+                                if et.endswith(".completed") or et.endswith(".done"):
+                                    tname = buf.get("name") or name
+                                    args_s = buf.get("args") or ""
+                                    try:
+                                        targs = json.loads(args_s) if args_s else {}
+                                    except Exception:
+                                        targs = {"query": args_s}
+                                    output = None
+                                    if tname == "web_search":
+                                        try:
+                                            output = google_search(targs.get("query", ""), int(targs.get("k") or ai_settings.get("search_max_results", 5)))
+                                        except Exception as e:
+                                            output = {"error": str(e)}
+                                    if output is not None:
+                                        try:
+                                            stream.submit_tool_outputs([
+                                                {"tool_call_id": tid, "output": json.dumps(output)}
+                                            ])
+                                        except Exception as e:
+                                            if socketio:
+                                                socketio.emit("ai_stream", {**ctx, "error": f"tool submit error: {e}"})
+                                    tool_buffers.pop(tid, None)
                     except Exception:
                         continue
 
