@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.0 — 2025-09-10
+
+Highlights:
+- Switched to OpenAI Responses API with streaming in the web UI.
+- Configurable OpenAI model and system prompt via Settings and settings.json.
+- Improved installer and Makefile reliability (pip via python -m, heredoc fix).
+
+Added:
+- Streaming responses over Socket.IO (`ai_stream` events) visible on the dashboard.
+- Settings UI fields for `openai_model` and `system_prompt`.
+- API: GET `/allowlist` now returns `openai_model` and `system_prompt`.
+
+Changed:
+- `query_openai_direct` now uses `client.responses.create` (was `chat.completions`).
+- Monitor replies still sent as a single iMessage after streaming completes.
+- README updated with streaming docs and model selection guidance.
+
+Fixed:
+- Pin `httpx==0.27.2` to resolve OpenAI client `proxies` arg error.
+- Pin `pytypedstream==0.1.0` (previous pin to 1.0.2 didn’t exist on PyPI).
+- Use `python -m pip` to avoid stale venv shebang issues.
+- Makefile heredoc indentation to fix “missing separator”.
+
+Upgrade Notes:
+- After pulling, run `make setup` to ensure pins are applied.
+- You can change the model/prompt in Settings → OpenAI Settings without restart.
+
 ## v0.2.0 — 2025-09-10
 
 Highlights:
@@ -45,4 +72,3 @@ Upgrade Notes:
 - Set env vars: `OPENAI_API_KEY`, `IMSG_AI_TOKEN`, `IMSG_AI_SECRET`.
 - Run `make setup` then `make doctor` to verify environment and permissions.
 - For background run at login: `make install-service` (provide envs inline).
-
