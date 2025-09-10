@@ -147,6 +147,11 @@ if "google_cse_id" not in ai_settings:
     ai_settings["google_cse_id"] = ""
 if "search_max_results" not in ai_settings:
     ai_settings["search_max_results"] = 5
+if "search_cache_ttl" not in ai_settings:
+    ai_settings["search_cache_ttl"] = 120
+
+# In-memory cache for web search results: { (normalized_query, k): (ts, results) }
+_search_cache: dict[tuple[str, int], tuple[float, list[dict]]] = {}
 if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
     # Decrypt into memory for runtime use
     try:
@@ -562,6 +567,54 @@ def google_search(query: str, k: int = 5) -> list[dict]:
         raise RuntimeError(f"Google Search error: {e}")
 
 
+def _norm_query(q: str) -> str:
+    return " ".join((q or "").strip().split()).lower()
+
+
+def web_search_cached(query: str, k: int) -> list[dict]:
+    ttl = 0
+    try:
+        ttl = int(ai_settings.get("search_cache_ttl", 120))
+    except Exception:
+        ttl = 120
+    key = (_norm_query(query), int(k or 5))
+    now = time.time()
+    if key in _search_cache:
+        ts, res = _search_cache[key]
+        if now - ts <= max(1, ttl):
+            return res
+    results = google_search(query, k)
+    _search_cache[key] = (now, results)
+    return results
+
+
+def _maybe_force_search_query(cmd: str) -> str | None:
+    """Heuristics: if the command clearly asks for browsing/news/stocks, return a search query."""
+    if not cmd:
+        return None
+    c = cmd.strip()
+    lc = c.lower()
+    prefixes = [
+        "search:", "search ",
+        "news:", "news ",
+        "latest ",
+        "headlines",
+        "latest stock price",
+        "stock price",
+    ]
+    for p in prefixes:
+        if lc.startswith(p):
+            # strip leading directive words
+            if p.endswith(":") or p.endswith(" "):
+                return c[len(p):].strip() or c
+            return c
+    # If the command contains strong browse cues
+    cues = ["today", "breaking", "headline", "latest", "stock price", "market today"]
+    if any(w in lc for w in cues):
+        return c
+    return None
+
+
 def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid: str | None = None, requester: str | None = None) -> str:
     """Stream a response via the Responses API and emit deltas over Socket.IO.
 
@@ -583,8 +636,35 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
 
     context_text = _format_context_for_model(_fetch_recent_messages_for_chat(chat_guid, limit=window) if chat_guid else [], requester, window)
 
-    # Build combined input with context + user request
-    input_text = (context_text.strip() + "\n\nUser request: " + command.strip()).strip()
+    # Optionally prefetch web results via heuristic (deterministic, plus tools remain available)
+    pre_results_text = ""
+    enable_search = bool(ai_settings.get("enable_search"))
+    forced_q = _maybe_force_search_query(command) if enable_search else None
+    if forced_q:
+        try:
+            k = int(ai_settings.get("search_max_results", 5))
+            results = web_search_cached(forced_q, k)
+            lines = ["Web results (heuristic):"]
+            for r in results or []:
+                if not r:
+                    continue
+                title = (r.get("title") or "").strip()
+                url = (r.get("url") or "").strip()
+                snippet = (r.get("snippet") or "").strip()
+                if title or url:
+                    lines.append(f"- {title} — {url}")
+                if snippet:
+                    lines.append(f"  {snippet}")
+            pre_results_text = "\n".join(lines)
+        except Exception as e:
+            pre_results_text = f"Web search error: {e}"
+
+    # Build combined input with context + optional web results + user request
+    parts = [context_text.strip()]
+    if pre_results_text:
+        parts.append(pre_results_text)
+    parts.append("User request: " + command.strip())
+    input_text = "\n\n".join(p for p in parts if p).strip()
 
     ctx = dict(emit_ctx or {})
     text_parts: list[str] = []
@@ -592,7 +672,6 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
     if hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
         try:
             tools = None
-            enable_search = bool(ai_settings.get("enable_search"))
             if enable_search:
                 tools = [{
                     "type": "function",
