@@ -10,8 +10,11 @@ from openai import OpenAI
 import typedstream
 import csv
 from pathlib import Path
+import PyPDF2
+import base64
+import mimetypes
 from cryptography.fernet import Fernet
-import httpx
+from tavily import TavilyClient
 
 
 # OpenAI API Key (env only)
@@ -23,6 +26,7 @@ CHAT_DB = os.path.expanduser("~/Library/Messages/chat.db")
 
 # App support/state path (persist last_seen_date)
 APP_SUPPORT_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "imessage-ai")
+TMP_IMAGES_DIR = os.path.join(APP_SUPPORT_DIR, "tmp_images")
 STATE_FILE = os.path.join(APP_SUPPORT_DIR, "state.json")
 
 # Flask SocketIO instance
@@ -36,6 +40,8 @@ SETTINGS_FILE = "settings.json"
 
 # Contacts no longer sourced from CSV; keep an empty map for display/logging.
 contacts = {}
+# Cache of handle -> display name from Contacts
+_contact_name_cache: dict[str, str] = {}
 
 def normalize_phone(s: str) -> str:
     """Normalize a phone number to a consistent form. Removes common punctuation and 'tel:' prefix.
@@ -182,6 +188,11 @@ def _ensure_app_support_dir():
         Path(APP_SUPPORT_DIR).mkdir(parents=True, exist_ok=True)
     except Exception as e:
         print(f"⚠️ Could not create app support dir: {e}")
+
+    try:
+        Path(TMP_IMAGES_DIR).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ Could not create tmp images dir: {e}")
 
 
 def _load_state():
@@ -336,7 +347,6 @@ def fetch_new_messages_all():
         ) as p on p.mid = m.rowid
         WHERE m.date > ?
         ORDER BY m.date ASC
-        LIMIT 200
         """,
         (last_seen_date,)
     )
@@ -538,40 +548,249 @@ def _format_context_for_model(history: list[dict], requester: str | None, limit:
     return "\n".join(lines)
 
 
-def google_search(query: str, k: int = 5) -> list[dict]:
-    """Search Google Programmable Search (CSE) and return a list of results.
+def _lookup_contact_name_via_contacts_app(handle: str) -> str | None:
+    """Best-effort lookup of a display name for a phone/email using Contacts via AppleScript.
 
-    Requires env GOOGLE_API_KEY and settings ai_settings["google_cse_id"].
+    Caches results to avoid repeated AppleScript calls. Returns None if not found or on error.
+    """
+    if not handle:
+        return None
+    key = normalize_handle(handle)
+    if key in _contact_name_cache:
+        return _contact_name_cache.get(key)
+    script = f'''
+    on normalizePhone(s)
+        set t to s as text
+        set out to ""
+        repeat with i from 1 to count of t
+            set ch to character i of t
+            if ch is in "+0123456789" then set out to out & ch
+        end repeat
+        return out
+    end normalizePhone
+
+    set target to "{key}"
+    set targetDigits to normalizePhone(target)
+    tell application "Contacts"
+        set foundName to missing value
+        repeat with p in people
+            -- phones
+            repeat with ph in (phones of p)
+                try
+                    set v to value of ph as text
+                    set v2 to normalizePhone(v)
+                    if v2 is not "" and v2 is equal to targetDigits then
+                        set foundName to name of p as text
+                        exit repeat
+                    end if
+                end try
+            end repeat
+            if foundName is not missing value then exit repeat
+            -- emails
+            repeat with em in (emails of p)
+                try
+                    set v to value of em as text
+                    if v is equal to target then
+                        set foundName to name of p as text
+                        exit repeat
+                    end if
+                end try
+            end repeat
+            if foundName is not missing value then exit repeat
+        end repeat
+    end tell
+    if foundName is missing value then
+        return ""
+    else
+        return foundName
+    end if
+    '''
+    try:
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=True)
+        name = (res.stdout or "").strip()
+        if name:
+            _contact_name_cache[key] = name
+            return name
+    except Exception:
+        pass
+    _contact_name_cache[key] = None  # cache miss
+    return None
+
+
+def _get_chat_participants(chat_guid: str) -> list[dict]:
+    """Return a list of participants for a chat with optional contact names.
+
+    Each item: {"handle": str, "name": str or None}
+    """
+    if not chat_guid:
+        return []
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT h.id
+            FROM handle AS h
+            INNER JOIN chat_handle_join AS chj ON chj.handle_id = h.rowid
+            INNER JOIN chat AS c ON c.rowid = chj.chat_id
+            WHERE c.guid = ?
+            """,
+            (chat_guid,),
+        )
+        rows = cur.fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    out = []
+    seen = set()
+    for (hid,) in rows or []:
+        h = normalize_handle(hid)
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        name = _lookup_contact_name_via_contacts_app(h)
+        out.append({"handle": h, "name": name})
+    return out
+
+
+def _parse_name_mentions(cmd: str) -> list[str]:
+    """Extract @name mentions (excluding '@ai') from a command string."""
+    if not cmd:
+        return []
+    toks = []
+    parts = cmd.split()
+    for p in parts:
+        if p.startswith("@") and len(p) > 1:
+            tag = p[1:].strip(".,:;!?)"]).lower()
+            if tag and tag != "ai":
+                toks.append(tag)
+    return toks
+
+
+def _resolve_mention_to_participant(chat_guid: str, mention: str) -> dict | None:
+    """Best-effort match of a mention like 'jon' to a chat participant by display name.
+
+    Returns {"handle": str, "name": str or None} or None.
+    """
+    mention_l = (mention or "").strip().lower()
+    if not mention_l:
+        return None
+    participants = _get_chat_participants(chat_guid)
+    # Exact and prefix/substring matching on normalized name
+    cand = None
+    for p in participants:
+        nm = (p.get("name") or "").strip()
+        if not nm:
+            continue
+        nl = nm.lower()
+        if nl == mention_l or nl.startswith(mention_l) or mention_l in nl:
+            cand = p
+            break
+    return cand
+
+
+def _resolve_mentions_in_chat(chat_guid: str, mentions: list[str]) -> tuple[list[dict], dict, list[str]]:
+    """Resolve a list of mentions to participants and fetch their latest messages.
+
+    Returns (resolved, ambiguous, missing)
+      - resolved: list of {mention, handle, name, latest_text}
+      - ambiguous: {mention: [candidates...]}, where candidate = {handle, name}
+      - missing: list of mentions that did not match anyone
+    """
+    resolved: list[dict] = []
+    ambiguous: dict[str, list[dict]] = {}
+    missing: list[str] = []
+    if not (chat_guid and mentions):
+        return resolved, ambiguous, missing
+
+    participants = _get_chat_participants(chat_guid)
+    # Build name->participant mapping for substring matches
+    for m in mentions:
+        m_l = (m or "").strip().lower()
+        if not m_l:
+            continue
+        cands = []
+        for p in participants:
+            nm = (p.get("name") or "").strip()
+            nl = nm.lower() if nm else ""
+            if nl and (nl == m_l or nl.startswith(m_l) or m_l in nl):
+                cands.append({"handle": p.get("handle"), "name": nm})
+        if not cands:
+            missing.append(m)
+            continue
+        if len(cands) > 1:
+            ambiguous[m] = cands
+            continue
+        # Exactly one candidate
+        chosen = cands[0]
+        # Find latest message text from this handle
+        latest_text = None
+        try:
+            hist = _fetch_recent_messages_for_chat(chat_guid, limit=50)
+            for msg in reversed(hist or []):
+                if normalize_handle(msg.get("address")) == chosen.get("handle") and not msg.get("is_from_me"):
+                    latest_text = (msg.get("text") or "").strip()
+                    if latest_text:
+                        break
+        except Exception:
+            latest_text = None
+        resolved.append({
+            "mention": m,
+            "handle": chosen.get("handle"),
+            "name": chosen.get("name"),
+            "latest_text": latest_text,
+        })
+    return resolved, ambiguous, missing
+
+
+def tavily_search(query: str, k: int = 5) -> dict:
+    """Search the web using Tavily API and return a structured payload.
+
+    Returns a dict with keys:
+      - answer: short synthesized answer (string or empty)
+      - results: list of {title, url, content, score}
+
+    Requires env TAVILY_API_KEY (or TAVILY_KEY).
     """
     query = (query or "").strip()
     if not query:
-        return []
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_CSE_API_KEY")
-    cse_id = ai_settings.get("google_cse_id") or ""
-    if not api_key or not cse_id:
-        raise RuntimeError("Google Search not configured (set GOOGLE_API_KEY and google_cse_id in Settings)")
-    params = {"key": api_key, "cx": cse_id, "q": query, "num": max(1, min(int(k or 5), 10))}
+        return {"answer": "", "results": []}
+    api_key = os.getenv("TAVILY_API_KEY") or os.getenv("TAVILY_KEY")
+    if not api_key:
+        raise RuntimeError("Tavily search not configured (set TAVILY_API_KEY)")
     try:
-        r = httpx.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        out = []
-        for item in (data.get("items") or [])[: params["num"]]:
-            out.append({
+        client = TavilyClient(api_key=api_key)
+        num = max(1, min(int(k or 5), 10))
+        data = client.search(
+            query=query,
+            max_results=num,
+            search_depth="basic",
+            include_answer="advanced",
+            include_images=False,
+            include_favicon=False,
+            country="united states",
+        )
+        answer = data.get("answer") or ""
+        out_results = []
+        for item in (data.get("results") or [])[:num]:
+            out_results.append({
                 "title": item.get("title"),
-                "url": item.get("link"),
-                "snippet": item.get("snippet") or "",
+                "url": item.get("url"),
+                "content": item.get("content") or "",
+                "score": item.get("score"),
             })
-        return out
+        return {"answer": answer, "results": out_results}
     except Exception as e:
-        raise RuntimeError(f"Google Search error: {e}")
+        raise RuntimeError(f"Tavily search error: {e}")
 
 
 def _norm_query(q: str) -> str:
     return " ".join((q or "").strip().split()).lower()
 
 
-def web_search_cached(query: str, k: int) -> list[dict]:
+def web_search_cached(query: str, k: int) -> dict:
     ttl = 0
     try:
         ttl = int(ai_settings.get("search_cache_ttl", 120))
@@ -583,9 +802,9 @@ def web_search_cached(query: str, k: int) -> list[dict]:
         ts, res = _search_cache[key]
         if now - ts <= max(1, ttl):
             return res
-    results = google_search(query, k)
-    _search_cache[key] = (now, results)
-    return results
+    data = tavily_search(query, k)
+    _search_cache[key] = (now, data)
+    return data
 
 
 def _maybe_force_search_query(cmd: str) -> str | None:
@@ -615,7 +834,371 @@ def _maybe_force_search_query(cmd: str) -> str | None:
     return None
 
 
-def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid: str | None = None, requester: str | None = None) -> str:
+def _is_image_row(uti: str | None, mime: str | None, filename: str | None) -> bool:
+    u = (uti or "").lower()
+    m = (mime or "").lower()
+    f = (filename or "").lower()
+    if m.startswith("image/"):
+        return True
+    if any(x in u for x in ("public.jpeg", "public.png", "public.tiff", "heic", "public.heic")):
+        return True
+    if any(f.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".heic", ".tif", ".tiff", ".webp")):
+        return True
+    return False
+
+
+def _is_pdf_row(uti: str | None, mime: str | None, filename: str | None) -> bool:
+    u = (uti or "").lower()
+    m = (mime or "").lower()
+    f = (filename or "").lower()
+    if m == "application/pdf" or "pdf" in u:
+        return True
+    if f.endswith(".pdf"):
+        return True
+    return False
+
+
+def _find_recent_image_attachments(chat_guid: str, before_date: int | None = None, max_images: int = 3) -> list[str]:
+    """Return up to max_images absolute file paths for recent image attachments in a chat."""
+    if not chat_guid:
+        return []
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cur = conn.cursor()
+        if before_date is None:
+            cur.execute(
+                """
+                SELECT a.filename, a.mime_type, a.uti, m.date
+                FROM message AS m
+                INNER JOIN chat_message_join AS cmj ON cmj.message_id = m.rowid
+                INNER JOIN chat AS c ON c.rowid = cmj.chat_id
+                INNER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
+                INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
+                WHERE c.guid = ?
+                ORDER BY m.date DESC
+                LIMIT 50
+                """,
+                (chat_guid,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT a.filename, a.mime_type, a.uti, m.date
+                FROM message AS m
+                INNER JOIN chat_message_join AS cmj ON cmj.message_id = m.rowid
+                INNER JOIN chat AS c ON c.rowid = cmj.chat_id
+                INNER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
+                INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
+                WHERE c.guid = ? AND m.date <= ?
+                ORDER BY m.date DESC
+                LIMIT 50
+                """,
+                (chat_guid, int(before_date)),
+            )
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    paths: list[str] = []
+    for (filename, mime_type, uti, _date) in rows or []:
+        if _is_image_row(uti, mime_type, filename) and filename:
+            try:
+                # Expand tilde if present
+                fp = os.path.expanduser(filename)
+                if os.path.exists(fp):
+                    paths.append(fp)
+                if len(paths) >= max_images:
+                    break
+            except Exception:
+                continue
+    return paths
+
+
+def _find_recent_pdf_attachments(chat_guid: str, before_date: int | None = None, max_docs: int = 3) -> list[str]:
+    if not chat_guid:
+        return []
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cur = conn.cursor()
+        if before_date is None:
+            cur.execute(
+                """
+                SELECT a.filename, a.mime_type, a.uti, m.date
+                FROM message AS m
+                INNER JOIN chat_message_join AS cmj ON cmj.message_id = m.rowid
+                INNER JOIN chat AS c ON c.rowid = cmj.chat_id
+                INNER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
+                INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
+                WHERE c.guid = ?
+                ORDER BY m.date DESC
+                LIMIT 50
+                """,
+                (chat_guid,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT a.filename, a.mime_type, a.uti, m.date
+                FROM message AS m
+                INNER JOIN chat_message_join AS cmj ON cmj.message_id = m.rowid
+                INNER JOIN chat AS c ON c.rowid = cmj.chat_id
+                INNER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
+                INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
+                WHERE c.guid = ? AND m.date <= ?
+                ORDER BY m.date DESC
+                LIMIT 50
+                """,
+                (chat_guid, int(before_date)),
+            )
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    paths: list[str] = []
+    for (filename, mime_type, uti, _date) in rows or []:
+        if _is_pdf_row(uti, mime_type, filename) and filename:
+            try:
+                fp = os.path.expanduser(filename)
+                if os.path.exists(fp):
+                    paths.append(fp)
+                if len(paths) >= max_docs:
+                    break
+            except Exception:
+                continue
+    return paths
+
+
+def _encode_image_as_data_url(path: str) -> str | None:
+    """Return a data URL for an image. Converts unsupported formats (e.g., HEIC/TIFF) to JPEG via 'sips'."""
+    try:
+        allowed = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+        mime, _ = mimetypes.guess_type(path)
+        if mime not in allowed:
+            # Try converting to JPEG using macOS 'sips'
+            try:
+                _ensure_app_support_dir()
+                base = os.path.splitext(os.path.basename(path))[0]
+                out_path = os.path.join(TMP_IMAGES_DIR, base + ".jpg")
+                subprocess.run(["sips", "-s", "format", "jpeg", path, "--out", out_path], check=True)
+                path = out_path
+                mime = "image/jpeg"
+            except Exception as ce:
+                print(f"⚠️ Failed to convert image {path} to JPEG: {ce}")
+        # Read and encode
+        with open(path, 'rb') as f:
+            data = f.read()
+        # If still unknown, default to jpeg
+        if not mime:
+            mime = 'image/jpeg'
+        if mime not in allowed:
+            print(f"⚠️ Skipping unsupported image mime {mime} for {path}")
+            return None
+        b64 = base64.b64encode(data).decode('ascii')
+        return f"data:{mime};base64,{b64}"
+    except Exception as e:
+        print(f"⚠️ Failed to read image {path}: {e}")
+        return None
+
+
+def describe_images_with_openai(image_paths: list[str], instruction: str | None = None) -> str:
+    """Call the OpenAI API with one or more images and return a concise description."""
+    if not image_paths:
+        return ""
+    prompt = (instruction or "Describe the image(s) clearly and concisely.").strip()
+    content = [{"type": "text", "text": prompt}]
+    attached = 0
+    for p in image_paths:
+        url = _encode_image_as_data_url(p)
+        if url:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+            attached += 1
+    if attached == 0:
+        return "I couldn't read any shared images (unsupported format). Please resend as JPEG/PNG/WebP or say 'convert and describe' and I'll try again."
+    try:
+        # Prefer chat.completions for multimodal messages
+        resp = openai_client.chat.completions.create(
+            model=(ai_settings.get("openai_model") or "gpt-4o-mini").strip(),
+            messages=[
+                {"role": "system", "content": ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief."},
+                {"role": "user", "content": content},
+            ],
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"Error describing image: {e}"
+
+
+def extract_text_from_pdf(path: str, max_chars: int = 30000) -> str:
+    try:
+        reader = PyPDF2.PdfReader(path)
+        texts = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                texts.append(t.strip())
+            if sum(len(x) for x in texts) > max_chars:
+                break
+        raw = "\n\n".join(texts)
+        if len(raw) > max_chars:
+            raw = raw[:max_chars]
+        return raw.strip()
+    except Exception as e:
+        return ""
+
+
+def summarize_text_with_openai(text: str, instruction: str | None = None) -> str:
+    if not (text or "").strip():
+        return ""
+    ask = (instruction or "Give a concise summary (5-7 bullets or 1 short paragraph). Focus on the main points, claims, and any important numbers.").strip()
+    try:
+        resp = openai_client.chat.completions.create(
+            model=(ai_settings.get("openai_model") or "gpt-4o-mini").strip(),
+            messages=[
+                {"role": "system", "content": ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief."},
+                {"role": "user", "content": ask + "\n\n=== Document ===\n" + text},
+            ],
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"Error summarizing document: {e}"
+
+
+def _upload_file_to_openai(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            fo = openai_client.files.create(file=f, purpose="assistants")
+        return getattr(fo, "id", None)
+    except Exception as e:
+        print(f"⚠️ Failed to upload file to OpenAI: {e}")
+        return None
+
+
+def summarize_pdfs_with_openai_file_refs(paths: list[str], instruction: str | None = None) -> str:
+    """Upload one or more PDFs to OpenAI and request a concise summary using the Responses API.
+
+    Falls back to local text extraction if the Responses API is unavailable or upload fails.
+    """
+    files = []
+    for p in paths or []:
+        if not p:
+            continue
+        fid = _upload_file_to_openai(p)
+        if fid:
+            files.append(fid)
+    prompt = (instruction or "Give a concise summary (5-7 bullets or 1 short paragraph). Focus on the main points, claims, and any important numbers.").strip()
+
+    # Use Responses API if available and we have file ids
+    if files and hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
+        try:
+            input_msg = [{
+                "role": "user",
+                "content": ([{"type": "input_text", "text": prompt}] + [{"type": "input_file", "file_id": fid} for fid in files])
+            }]
+            resp = openai_client.responses.create(
+                model=(ai_settings.get("openai_model") or "gpt-4o-mini").strip(),
+                input=input_msg,
+                instructions=ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief.",
+            )
+            try:
+                text = getattr(resp, "output_text", None)
+                if text:
+                    return text
+            except Exception:
+                pass
+            # Fallback: concatenate parts
+            parts = []
+            try:
+                for item in getattr(resp, "output", []) or []:
+                    for c in getattr(item, "content", []) or []:
+                        t = getattr(c, "text", None)
+                        if t:
+                            parts.append(t)
+            except Exception:
+                pass
+            if parts:
+                return "".join(parts)
+            return str(resp)
+        except Exception as e:
+            print(f"⚠️ Responses API failed for PDF summary: {e}")
+
+    # Fallback: local text extraction + text summarization
+    try:
+        texts = []
+        for p in paths or []:
+            t = extract_text_from_pdf(p)
+            if not t:
+                continue
+            texts.append(t)
+        if not texts:
+            return "I couldn't read the PDF(s). They may be scanned/image-only or protected."
+        merged = "\n\n".join(texts)
+        return summarize_text_with_openai(merged, instruction=prompt)
+    except Exception as e:
+        return f"Error summarizing document: {e}"
+
+
+def _infer_requested_image_count(text: str, default: int = 1) -> int:
+    """Infer how many images the user asked to consider. Defaults to 1 (latest).
+
+    Recognizes simple numeric mentions (e.g., "last 3"), and keywords like
+    "both", "couple" (2), "few"/"several"/"more pictures" (3), and "all" (up to 5).
+    Caps between 1 and 5.
+    """
+    try:
+        t = (text or "").lower()
+        if not t:
+            return max(1, min(default, 5))
+        # Keywords
+        if "all" in t:
+            return 5
+        if any(k in t for k in ("both", "couple")):
+            return 2
+        if any(k in t for k in ("few", "several", "more picture", "more images", "more pics", "recent pictures", "recent images")):
+            return 3
+        # Word numbers
+        words_map = {
+            "two": 2, "three": 3, "four": 4, "five": 5,
+            "2": 2, "3": 3, "4": 4, "5": 5,
+        }
+        for w, n in words_map.items():
+            if w in t:
+                return max(1, min(n, 5))
+        # Digits anywhere
+        import re
+        m = re.search(r"(\d+)", t)
+        if m:
+            try:
+                n = int(m.group(1))
+                return max(1, min(n, 5))
+            except Exception:
+                pass
+        return max(1, min(default, 5))
+    except Exception:
+        return max(1, min(default, 5))
+
+
+def _is_search_configured() -> bool:
+    """Return True if web search is enabled and Tavily API key is present."""
+    if not bool(ai_settings.get("enable_search")):
+        return False
+    api_key = os.getenv("TAVILY_API_KEY") or os.getenv("TAVILY_KEY")
+    return bool(api_key)
+
+
+def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid: str | None = None, requester: str | None = None, extra_context: str | None = None) -> str:
     """Stream a response via the Responses API and emit deltas over Socket.IO.
 
     Returns the final concatenated text.
@@ -639,28 +1222,75 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
     # Optionally prefetch web results via heuristic (deterministic, plus tools remain available)
     pre_results_text = ""
     enable_search = bool(ai_settings.get("enable_search"))
-    forced_q = _maybe_force_search_query(command) if enable_search else None
+    search_configured = _is_search_configured()
+    try:
+        print(f"🧠 query_openai_stream: enable_search={enable_search} configured={search_configured}")
+    except Exception:
+        pass
+    forced_q = _maybe_force_search_query(command) if search_configured else None
     if forced_q:
         try:
             k = int(ai_settings.get("search_max_results", 5))
-            results = web_search_cached(forced_q, k)
+            data = web_search_cached(forced_q, k)
             lines = ["Web results (heuristic):"]
-            for r in results or []:
+            ans = (data.get("answer") or "").strip()
+            if ans:
+                lines.append(f"Answer: {ans}")
+            for r in (data.get("results") or []):
                 if not r:
                     continue
                 title = (r.get("title") or "").strip()
                 url = (r.get("url") or "").strip()
-                snippet = (r.get("snippet") or "").strip()
+                content = (r.get("content") or "").strip()
+                score = r.get("score")
+                score_s = f" ({score:.2f})" if isinstance(score, (int, float)) else ""
                 if title or url:
-                    lines.append(f"- {title} — {url}")
-                if snippet:
-                    lines.append(f"  {snippet}")
+                    lines.append(f"- {title}{score_s} — {url}")
+                if content:
+                    lines.append(f"  {content}")
             pre_results_text = "\n".join(lines)
         except Exception as e:
-            pre_results_text = f"Web search error: {e}"
+            # If search is enabled but misconfigured, avoid nudging the model into tools.
+            pre_results_text = f"Web search unavailable: {e}"
+
+    # Fast-path: if it's clearly a news/search query and search is configured, return headlines directly
+    if forced_q:
+        try:
+            print(f"🧠 fast-path web headlines for query='{forced_q}'")
+        except Exception:
+            pass
+        try:
+            k = int(ai_settings.get("search_max_results", 5))
+        except Exception:
+            k = 5
+        try:
+            data = web_search_cached(forced_q, k)
+            if data:
+                lines = []
+                ans = (data.get("answer") or "").strip()
+                if ans:
+                    lines.append(ans)
+                    # Add a blank line before the list for readability
+                    lines.append("")
+                for i, r in enumerate((data.get("results") or []), 1):
+                    title = (r.get("title") or "").strip()
+                    url = (r.get("url") or "").strip()
+                    score = r.get("score")
+                    score_s = f" ({score:.2f})" if isinstance(score, (int, float)) else ""
+                    if title and url:
+                        lines.append(f"{i}. {title}{score_s} — {url}")
+                # Join with new lines to produce a clean layout
+                out_text = "\n".join([ln for ln in lines if ln is not None])
+                if out_text.strip():
+                    return out_text
+        except Exception as e:
+            # Fall back to model if search unexpectedly fails here
+            pass
 
     # Build combined input with context + optional web results + user request
     parts = [context_text.strip()]
+    if extra_context:
+        parts.append(extra_context.strip())
     if pre_results_text:
         parts.append(pre_results_text)
     parts.append("User request: " + command.strip())
@@ -672,20 +1302,20 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
     if hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
         try:
             tools = None
-            if enable_search:
+            # Only expose tools when fully configured to avoid the model waiting on tool calls
+            if search_configured:
+                # Responses API tool shape (not Chat Completions): top-level name/parameters
                 tools = [{
                     "type": "function",
-                    "function": {
-                        "name": "web_search",
-                        "description": "Search the web for up-to-date information using Google Programmable Search",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string", "description": "The search query"},
-                                "k": {"type": "integer", "minimum": 1, "maximum": 10, "default": int(ai_settings.get("search_max_results", 5))},
-                            },
-                            "required": ["query"],
+                    "name": "web_search",
+                    "description": "Search the web for up-to-date information using Tavily",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "The search query"},
+                            "k": {"type": "integer", "minimum": 1, "maximum": 10, "default": int(ai_settings.get("search_max_results", 5))},
                         },
+                        "required": ["query"],
                     },
                 }]
 
@@ -699,6 +1329,14 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
                 for event in stream:
                     try:
                         et = getattr(event, "type", "")
+                        # Debug trace for tricky tool flows (only when clearly a tool event)
+                        if et.startswith("response.tool_call"):
+                            try:
+                                name = getattr(event, "name", None)
+                                if name:
+                                    print(f"🛠 Tool event: {et} name={name}")
+                            except Exception:
+                                pass
                         if et == "response.output_text.delta":
                             delta = getattr(event, "delta", None)
                             if delta:
@@ -734,7 +1372,7 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
                                     output = None
                                     if tname == "web_search":
                                         try:
-                                            output = google_search(targs.get("query", ""), int(targs.get("k") or ai_settings.get("search_max_results", 5)))
+                                            output = tavily_search(targs.get("query", ""), int(targs.get("k") or ai_settings.get("search_max_results", 5)))
                                         except Exception as e:
                                             output = {"error": str(e)}
                                     if output is not None:
@@ -757,6 +1395,14 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
                     final_text = None
                 if not final_text:
                     final_text = "".join(text_parts)
+                # If the stream yielded no text, fallback to a non-streaming call
+                if not (final_text or "").strip():
+                    try:
+                        fallback = query_openai_direct(command)
+                        if fallback:
+                            final_text = fallback
+                    except Exception:
+                        pass
 
                 if socketio:
                     done_payload = {"done": True, "text": final_text}
@@ -795,6 +1441,18 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
             except Exception:
                 continue
         final_text = "".join(text_parts)
+        if not (final_text or "").strip():
+            try:
+                resp = openai_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": input_text},
+                    ],
+                )
+                final_text = resp.choices[0].message.content
+            except Exception:
+                pass
         if not final_text:
             # As a final fallback, request non-streaming
             resp = openai_client.chat.completions.create(
@@ -839,6 +1497,7 @@ def monitor_db_polling_general():
             message = item.get("text", "")
             chat_guid = item.get("chat_guid")
             chat_type = item.get("chat_type")
+            date_raw = item.get("date_raw")
 
             if not phone_number or not message:
                 continue
@@ -860,7 +1519,62 @@ def monitor_db_polling_general():
             if allowed and cmd:
                 try:
                     emit_ctx = {"phone": phone_number, "chat_type": chat_type, "chat_guid": chat_guid}
-                    ai_reply = query_openai_stream(cmd, emit_ctx, chat_guid=chat_guid, requester=phone_number)
+                    # If the request seems to be about an image or a PDF, try specialized handlers
+                    wants_image_desc = any(w in cmd.lower() for w in ["describe", "image", "picture", "photo", "pic", "what is this", "what's this"]) or cmd.strip().lower() in ("describe", "describe this", "describe the picture", "describe the image")
+                    wants_pdf_summary = ("pdf" in cmd.lower() or any(w in cmd.lower() for w in ["document", "article", "paper", "report"])) and any(w in cmd.lower() for w in ["summary", "summarize", "tl;dr", "quick summary", "short summary", "overview", "explain"])
+                    ai_reply = None
+                    if chat_guid and wants_image_desc:
+                        max_imgs = _infer_requested_image_count(cmd, default=1)
+                        img_paths = _find_recent_image_attachments(chat_guid, before_date=date_raw, max_images=max_imgs)
+                        if img_paths:
+                            print(f"🖼 Describing {len(img_paths)} image(s) for chat {chat_guid}")
+                            ai_reply = describe_images_with_openai(img_paths, instruction=cmd)
+                    elif chat_guid and wants_pdf_summary:
+                        max_docs = _infer_requested_image_count(cmd, default=1)
+                        pdf_paths = _find_recent_pdf_attachments(chat_guid, before_date=date_raw, max_docs=max_docs)
+                        if pdf_paths:
+                            print(f"📄 Summarizing {len(pdf_paths)} PDF(s) for chat {chat_guid}")
+                            if max_docs == 1 or len(pdf_paths) == 1:
+                                only_path = pdf_paths[0]
+                                only_name = os.path.basename(only_path)
+                                s = summarize_pdfs_with_openai_file_refs([only_path], instruction=cmd)
+                                ai_reply = f"{only_name}:\n{s}" if s else s
+                            else:
+                                parts = []
+                                for idx, p in enumerate(pdf_paths, 1):
+                                    s = summarize_pdfs_with_openai_file_refs([p], instruction=cmd)
+                                    if s:
+                                        name = os.path.basename(p)
+                                        parts.append(f"{idx}. {name}: {s}")
+                                ai_reply = "\n\n".join(parts)
+                    if not ai_reply:
+                        # Name mentions support: resolve @name to a participant and pull their latest message
+                        extra_ctx = None
+                        mentions = _parse_name_mentions(cmd)
+                        if chat_guid and mentions:
+                            resolved, ambiguous, missing = _resolve_mentions_in_chat(chat_guid, mentions)
+                            # If any ambiguous, ask for clarification and skip model call
+                            if ambiguous:
+                                lines = ["I found multiple matches:"]
+                                for m, cands in ambiguous.items():
+                                    lines.append(f"For @{m}:")
+                                    for i, c in enumerate(cands, 1):
+                                        disp = c.get("name") or c.get("handle")
+                                        lines.append(f"  {i}. {disp} ({c.get('handle')})")
+                                lines.append("")
+                                lines.append("Please reply like: '@ai choose 2 for @jon' or '@ai choose 1 for @mary'.")
+                                ai_reply = "\n".join(lines)
+                            elif resolved:
+                                # Build extra context blocks for all resolved mentions
+                                blocks = []
+                                for r in resolved:
+                                    disp = r.get("name") or r.get("handle")
+                                    if r.get("latest_text"):
+                                        blocks.append(f"Target from @{r.get('mention')} ({disp}):\n{r.get('latest_text')}")
+                                extra_ctx = "\n\n".join(blocks) if blocks else None
+
+                        if not ai_reply:
+                            ai_reply = query_openai_stream(cmd, emit_ctx, chat_guid=chat_guid, requester=phone_number, extra_context=extra_ctx)
                 except Exception as e:
                     ai_reply = f"Error: {e}"
 

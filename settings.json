@@ -7,6 +7,10 @@
         "+13149287472"
     ],
     "allowed_users_encrypted": [
-        "gAAAAABowOea2xabeyse4rFpLrq8csjQRerPYU_xgkpAUYMp9KvrWUoj_1tyDJFwmygcG1tGMIsVnGiyepkm-ReKu7Tfg8lOpg=="
-    ]
+        "gAAAAABowPMq2GEo1XWQKh09CiQJVkJVNFGYzfchssxb5TCaGLVu21nuCeSd-mOgbQSwNiOrHbtc1nlRhMzE4PptUbIJlUK6zg=="
+    ],
+    "enable_search": true,
+    "google_cse_id": "43a692e6bec084600",
+    "search_max_results": 5,
+    "search_cache_ttl": 120
 }

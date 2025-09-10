@@ -142,14 +142,12 @@ def update_ai_settings():
             agent.ai_settings["context_window"] = cw
         except Exception:
             pass
-    # Search settings
+    # Search settings (Tavily)
     if "enable_search" in request.form:
         agent.ai_settings["enable_search"] = True
     else:
         # Checkbox not sent means off
         agent.ai_settings["enable_search"] = False
-    if "google_cse_id" in request.form:
-        agent.ai_settings["google_cse_id"] = (request.form.get("google_cse_id", "") or "").strip()
     if "search_max_results" in request.form:
         smr_raw = (request.form.get("search_max_results", "") or "").strip()
         try:
@@ -175,7 +173,6 @@ def get_allowlist():
         "system_prompt": agent.ai_settings.get("system_prompt", "You are a concise, helpful assistant. Keep answers brief."),
         "context_window": agent.ai_settings.get("context_window", 25),
         "enable_search": agent.ai_settings.get("enable_search", False),
-        "google_cse_id": agent.ai_settings.get("google_cse_id", ""),
         "search_max_results": agent.ai_settings.get("search_max_results", 5),
     })
 
