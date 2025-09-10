@@ -22,7 +22,8 @@ if [[ ! -x .venv/bin/python ]]; then
   python3 -m venv .venv
 fi
 echo "Installing dependencies (pinned)..."
-.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+.venv/bin/python -m pip install -r requirements.txt
 
 # 3) Collect configuration
 read -r -p "Enter your OPENAI_API_KEY (required): " OPENAI_API_KEY

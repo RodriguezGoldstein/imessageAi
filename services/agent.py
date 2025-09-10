@@ -133,6 +133,11 @@ def decrypt_list(tokens: list[str]) -> list[str]:
 # Ensure generalized agent settings exist
 if "ai_trigger_tag" not in ai_settings:
     ai_settings["ai_trigger_tag"] = "@ai"
+# OpenAI config (model + system prompt) with sensible defaults
+if "openai_model" not in ai_settings:
+    ai_settings["openai_model"] = "gpt-4o-mini"
+if "system_prompt" not in ai_settings:
+    ai_settings["system_prompt"] = "You are a concise, helpful assistant. Keep answers brief."
 if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
     # Decrypt into memory for runtime use
     try:
@@ -403,23 +408,106 @@ def extract_trigger_command(text: str, tag: str = "@ai") -> str:
 
 ### 📌 Helper: Query OpenAI directly with a command ###
 def query_openai_direct(command: str) -> str:
-    """Simple passthrough to OpenAI for @ai commands."""
+    """Query OpenAI via the Responses API using configurable model and system prompt."""
     if not command:
         return ""
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a concise, helpful assistant. Keep answers brief."},
-            {"role": "user", "content": command},
-        ]
+    model = (ai_settings.get("openai_model") or "gpt-4o-mini").strip()
+    system_prompt = ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief."
+
+    # Use Responses API (preferred over chat.completions)
+    resp = openai_client.responses.create(
+        model=model,
+        input=command,
+        instructions=system_prompt,
     )
-    return response.choices[0].message.content
+
+    # Prefer convenience attribute if available
+    text = None
+    try:
+        text = getattr(resp, "output_text", None)
+    except Exception:
+        text = None
+    if text:
+        return text
+
+    # Fallback: concatenate text parts from structured output
+    try:
+        parts = []
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                t = getattr(c, "text", None)
+                if t:
+                    parts.append(t)
+        if parts:
+            return "".join(parts)
+    except Exception:
+        pass
+
+    # Last resort: stringify the response
+    return str(resp)
+
+
+def query_openai_stream(command: str, emit_ctx: dict | None = None) -> str:
+    """Stream a response via the Responses API and emit deltas over Socket.IO.
+
+    Returns the final concatenated text.
+    """
+    if not command:
+        return ""
+    model = (ai_settings.get("openai_model") or "gpt-4o-mini").strip()
+    system_prompt = ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief."
+
+    ctx = dict(emit_ctx or {})
+    text_parts: list[str] = []
+    try:
+        # Stream events from the Responses API
+        with openai_client.responses.stream(
+            model=model,
+            input=command,
+            instructions=system_prompt,
+        ) as stream:
+            for event in stream:
+                try:
+                    if getattr(event, "type", "") == "response.output_text.delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            text_parts.append(delta)
+                            if socketio:
+                                payload = {"delta": delta}
+                                payload.update(ctx)
+                                socketio.emit("ai_stream", payload)
+                except Exception:
+                    # Ignore malformed events but continue streaming
+                    continue
+
+            # Try to obtain final text from helper or fallback to collected parts
+            final_text = None
+            try:
+                final_text = getattr(stream, "get_final_text", lambda: None)()
+            except Exception:
+                final_text = None
+            if not final_text:
+                final_text = "".join(text_parts)
+
+            if socketio:
+                done_payload = {"done": True, "text": final_text}
+                done_payload.update(ctx)
+                socketio.emit("ai_stream", done_payload)
+            return final_text
+    except Exception as e:
+        if socketio:
+            err_payload = {"error": str(e)}
+            err_payload.update(ctx)
+            socketio.emit("ai_stream", err_payload)
+        return f"Error: {e}"
 
 
 ### 📌 Function: Monitor DB with @ai Trigger ###
 def monitor_db_polling_general():
     """Polls for new messages and reacts only to @ai triggers from allowed users."""
     print("🔍 General monitor: polling chat.db for new messages every 5 seconds...")
+    print(f"🔧 Trigger tag: {ai_settings.get('ai_trigger_tag', '@ai')}")
+    print(f"🔧 Allowed users: {ai_settings.get('allowed_users', [])}")
 
     # Initialize last_seen_date from persisted state/DB
     _ensure_app_support_dir()
@@ -448,9 +536,15 @@ def monitor_db_polling_general():
 
             # Check trigger and allowlist
             cmd = extract_trigger_command(message, ai_settings.get("ai_trigger_tag", "@ai"))
-            if phone_number in ai_settings.get("allowed_users", []) and cmd:
+            if cmd:
+                print(f"🔎 Trigger detected. Sender={phone_number} Cmd='{cmd}'")
+            allowed = phone_number in ai_settings.get("allowed_users", [])
+            if not allowed and cmd:
+                print(f"⛔ Ignoring trigger: sender not in allowlist. Allowed={ai_settings.get('allowed_users', [])}")
+            if allowed and cmd:
                 try:
-                    ai_reply = query_openai_direct(cmd)
+                    emit_ctx = {"phone": phone_number, "chat_type": chat_type, "chat_guid": chat_guid}
+                    ai_reply = query_openai_stream(cmd, emit_ctx)
                 except Exception as e:
                     ai_reply = f"Error: {e}"
 

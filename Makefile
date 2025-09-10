@@ -1,6 +1,6 @@
 REPO_DIR := $(CURDIR)
 PYTHON := $(REPO_DIR)/.venv/bin/python
-PIP := $(REPO_DIR)/.venv/bin/pip
+PIP := $(PYTHON) -m pip
 PLIST_NAME := com.imessage.ai
 PLIST_TMPL := packaging/$(PLIST_NAME).plist.tmpl
 PLIST_DEST := $(HOME)/Library/LaunchAgents/$(PLIST_NAME).plist
@@ -11,6 +11,7 @@ LOG_FILE := $(LOG_DIR)/imessage-ai.log
 
 setup:
 	python3 -m venv .venv
+	$(PIP) install --upgrade pip setuptools wheel
 	$(PIP) install -r requirements.txt
 
 run:
@@ -50,31 +51,32 @@ doctor:
 	@echo "Checking virtualenv..."
 	@[ -x "$(PYTHON)" ] && echo "venv OK" || echo "venv missing; run: make setup"
 	@echo "Checking Python packages..."
-	@[ -x "$(PYTHON)" ] && $(PYTHON) - <<'PY' || echo "(skipped)"
-import pkg_resources
-reqs = [
-    'flask==3.0.3',
-    'flask_socketio==5.3.6',
-    'openai==1.37.0',
-    'pytypedstream==1.0.2',
-    'schedule==1.2.1',
-]
-ok = True
-for r in reqs:
-    try:
-        pkg_resources.require([r])
-        print('[OK] ' + r)
-    except Exception as e:
-        ok = False
-        print('[MISSING] ' + r, e)
-print('Dependencies OK' if ok else 'Some dependencies missing; run: make setup')
-PY
+	@[ -x "$(PYTHON)" ] && $(PYTHON) - <<-'PY' || echo "(skipped)"
+	import pkg_resources
+	reqs = [
+	    'flask==3.0.3',
+	    'flask_socketio==5.3.6',
+	    'openai==1.37.0',
+	    'httpx==0.27.2',
+	    'pytypedstream==0.1.0',
+	    'schedule==1.2.1',
+	]
+	ok = True
+	for r in reqs:
+	    try:
+	        pkg_resources.require([r])
+	        print('[OK] ' + r)
+	    except Exception as e:
+	        ok = False
+	        print('[MISSING] ' + r, e)
+	print('Dependencies OK' if ok else 'Some dependencies missing; run: make setup')
+	PY
 	@echo "Checking Messages DB access..."
-	@([ -x "$(PYTHON)" ] && $(PYTHON) - <<'PY'
-from services.agent import check_db_reachability
-ok, err = check_db_reachability()
-print("DB OK" if ok else f"DB ERROR: {err}")
-PY
+	@([ -x "$(PYTHON)" ] && $(PYTHON) - <<-'PY'
+	from services.agent import check_db_reachability
+	ok, err = check_db_reachability()
+	print("DB OK" if ok else f"DB ERROR: {err}")
+	PY
 	) || echo "Could not run DB check; ensure venv is set up."
 	@echo "If DB ERROR, grant Full Disk Access to your terminal/python and retry."
 	@echo "Checking AppleScript / Automation permission..."

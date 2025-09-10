@@ -15,7 +15,8 @@ This project is focused on privacy and explicit control: the agent never auto-re
 - Allowlist of phone numbers that can use the trigger.
 - Group chat support: replies go back to the same group thread by chat GUID.
 - Dashboard: real-time feed of messages and AI replies via WebSockets.
-- Settings page: manage trigger tag and allowlist from your browser.
+- Streaming responses in the web UI while the model thinks.
+- Settings page: manage trigger tag, allowlist, and OpenAI model/prompt from your browser.
 - Bulk send and scheduled messages to contacts from `contacts.csv`.
 
 ## Architecture
@@ -24,7 +25,7 @@ This project is focused on privacy and explicit control: the agent never auto-re
 - Agent core: `services/agent.py` polls `~/Library/Messages/chat.db` for new messages and sends replies with AppleScript.
 - UI: `templates/dashboard.html` for live feed; `templates/settings.html` for trigger + allowlist management.
 - Data:
-  - `settings.json` – stores `ai_trigger_tag` and the allowlist (encrypted at rest).
+  - `settings.json` – stores `ai_trigger_tag`, `openai_model`, `system_prompt`, and the allowlist (encrypted at rest).
 
 ## Requirements
 
@@ -93,6 +94,8 @@ PY
 ```json
 {
   "ai_trigger_tag": "@ai",
+  "openai_model": "gpt-4o-mini",
+  "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
   "allowed_users": ["+11234567890"]
 }
 ```
@@ -143,8 +146,9 @@ The agent replies in the same direct chat or group.
 
 ## HTTP API
 
-- GET `/allowlist` → `{ ai_trigger_tag, allowed_users, contacts }`
+- GET `/allowlist` → `{ ai_trigger_tag, allowed_users, openai_model, system_prompt }`
 - POST `/allowlist` (JSON) → update `ai_trigger_tag` and `allowed_users`
+- POST `/update_ai_settings` (form) → update `ai_trigger_tag`, `openai_model`, `system_prompt`, `allowed_users`
 - GET `/healthz` → `{ ok, db_ok, db_error, last_seen_date }`
 
 Programmatic send:
@@ -183,9 +187,21 @@ curl -X POST http://127.0.0.1:5000/api/send \
 ## Dashboard
 
 - Real-time list of received messages and bot replies (with [Group]/[Direct] indicator; group shows `chat_guid`).
+- Streaming AI output in the UI as partial tokens, finalized into a single reply.
 - Bulk send: paste phone numbers (comma/newline separated) and a message.
 - Schedule a message for a time of day to pasted numbers.
 - Link to Settings page for trigger and allowlist.
+
+### Streaming behavior
+
+- The web UI shows partial output live over a Socket.IO event `ai_stream`.
+- The final response is sent once to iMessage (not token-by-token) to avoid spamming chats.
+
+## Model selection
+
+- Default in this repo: `gpt-4o-mini` for low-latency, low-cost replies.
+- You can set the model and system prompt in Settings or by editing `settings.json`.
+- If you prefer higher quality, set `openai_model` to `gpt-4o`.
 
 ## Service Setup (launchd)
 

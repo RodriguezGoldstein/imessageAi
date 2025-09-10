@@ -1,5 +1,9 @@
 {
-  "ai_trigger_tag": "@ai",
-  "allowed_users": [
-  ]
+    "ai_trigger_tag": "@ai",
+    "openai_model": "gpt-5-nano",
+    "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
+    "allowed_users": [],
+    "allowed_users_encrypted": [
+        "gAAAAABowN27hkPxWNNebr0N0c4uE6TCnuxVTJOP7myOJ2VfUd3aR4k9-O9t_v8cXq4egR_DbrLbTivv1oYFE69pxXBCvEhyzQ=="
+    ]
 }

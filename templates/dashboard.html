@@ -43,6 +43,7 @@
 
     <script>
         var socket = io();
+        var currentStreams = {};
 
         function appendTextItem(prefixEmoji, strongText, trailingText, listId) {
             var li = document.createElement('li');
@@ -79,6 +80,33 @@
             console.error("Agent error:", data);
             var hint = data && data.hint ? (' ' + data.hint) : '';
             appendTextItem('⚠️', 'Agent Error:', (data && data.error ? data.error : '') + hint, 'messages');
+        });
+
+        // Streaming AI output
+        socket.on("ai_stream", function(data) {
+            console.log("🌀 AI Stream:", data);
+            var key = (data.chat_type === 'Group' && data.chat_guid) ? data.chat_guid : data.phone || 'global';
+            var el = currentStreams[key];
+            if (!el) {
+                el = document.createElement('li');
+                el.dataset.key = key;
+                el.innerHTML = '<strong>🤖 AI (streaming):</strong> <span class="content"></span>';
+                document.getElementById('analytics').appendChild(el);
+                currentStreams[key] = el;
+            }
+            var span = el.querySelector('.content');
+            if (data.delta) {
+                span.textContent += data.delta;
+            }
+            if (data.error) {
+                el.innerHTML = '<strong>❌ AI Error:</strong> ' + data.error;
+                delete currentStreams[key];
+            }
+            if (data.done) {
+                var finalText = data.text || span.textContent || '';
+                el.innerHTML = '<strong>🤖 AI Reply:</strong> ' + finalText;
+                delete currentStreams[key];
+            }
         });
 
         // Handle errors

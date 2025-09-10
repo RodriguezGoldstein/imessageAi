@@ -32,7 +32,13 @@
                 <label>Tag (e.g., @ai):
                     <input type="text" name="ai_trigger_tag" value="{{ ai_settings.get('ai_trigger_tag', '@ai') }}" />
                 </label>
-                <button type="submit">Save Tag</button>
+                <h3>OpenAI Settings</h3>
+                <label>Model:
+                    <input type="text" name="openai_model" value="{{ ai_settings.get('openai_model', 'gpt-4o-mini') }}" />
+                </label>
+                <label>System Prompt:</label>
+                <textarea name="system_prompt" rows="3" placeholder="You are a concise, helpful assistant. Keep answers brief.">{{ ai_settings.get('system_prompt', 'You are a concise, helpful assistant. Keep answers brief.') }}</textarea>
+                <button type="submit">Save General Settings</button>
             </form>
         </div>
 

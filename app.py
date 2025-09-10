@@ -122,6 +122,15 @@ def update_ai_settings():
         for token in [t.strip() for t in extra_raw.replace("\n", ",").split(",") if t.strip()]:
             allowed.add(agent.normalize_handle(token))
         agent.ai_settings["allowed_users"] = sorted(list(allowed))
+    # OpenAI settings
+    if "openai_model" in request.form:
+        m = (request.form.get("openai_model", "") or "").strip()
+        if m:
+            agent.ai_settings["openai_model"] = m
+    if "system_prompt" in request.form:
+        sp = (request.form.get("system_prompt", "") or "").strip()
+        if sp:
+            agent.ai_settings["system_prompt"] = sp
     agent.save_ai_settings()
     return "AI Settings Updated!", 200
 
@@ -132,6 +141,8 @@ def get_allowlist():
     return jsonify({
         "ai_trigger_tag": agent.ai_settings.get("ai_trigger_tag", "@ai"),
         "allowed_users": agent.ai_settings.get("allowed_users", []),
+        "openai_model": agent.ai_settings.get("openai_model", "gpt-4o-mini"),
+        "system_prompt": agent.ai_settings.get("system_prompt", "You are a concise, helpful assistant. Keep answers brief."),
     })
 
 
