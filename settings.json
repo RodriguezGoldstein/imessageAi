@@ -3,8 +3,10 @@
     "openai_model": "gpt-5-nano",
     "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
     "context_window": 25,
-    "allowed_users": [],
+    "allowed_users": [
+        "+13149287472"
+    ],
     "allowed_users_encrypted": [
-        "gAAAAABowORr8V5p6xod0zMbbM2kKAPUdkWEp4h4b4o1sf88JkD21h2feGWH1yRPcB-MLHldgEOkGfmfrKSREJ0dYoEoLQgSVg=="
+        "gAAAAABowOea2xabeyse4rFpLrq8csjQRerPYU_xgkpAUYMp9KvrWUoj_1tyDJFwmygcG1tGMIsVnGiyepkm-ReKu7Tfg8lOpg=="
     ]
 }

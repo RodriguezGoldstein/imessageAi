@@ -310,6 +310,7 @@ def fetch_new_messages_all():
             h.id AS address,
             m.date,
             m.attributedBody,
+            m.text as plain_text,
             m.service
         FROM message AS m
         LEFT JOIN handle AS h ON h.rowid = m.handle_id
@@ -321,8 +322,7 @@ def fetch_new_messages_all():
             INNER JOIN chat_message_join as cmj on cmj.chat_id = chj.chat_id
             GROUP BY cmj.message_id, cmj.chat_id
         ) as p on p.mid = m.rowid
-        WHERE m.is_from_me = 0
-          AND m.date > ?
+        WHERE m.date > ?
         ORDER BY m.date ASC
         LIMIT 200
         """,
@@ -335,12 +335,16 @@ def fetch_new_messages_all():
         conn.close()
 
     messages = []
-    for (message_id, message_group, chat_guid, chat_type, is_from_me, address, date_raw, attributedBody, service) in rows:
+    for (message_id, message_group, chat_guid, chat_type, is_from_me, address, date_raw, attributedBody, plain_text, service) in rows:
 
-        try:
-            text = typedstream.unarchive_from_data(attributedBody).contents[0].value.value if attributedBody else ""
-        except Exception:
-            text = ""
+        text = None
+        if attributedBody:
+            try:
+                text = typedstream.unarchive_from_data(attributedBody).contents[0].value.value
+            except Exception:
+                text = None
+        if not text:
+            text = plain_text or ""
 
         if date_raw and date_raw > last_seen_date:
             last_seen_date = date_raw
@@ -417,37 +421,51 @@ def query_openai_direct(command: str) -> str:
     model = (ai_settings.get("openai_model") or "gpt-4o-mini").strip()
     system_prompt = ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief."
 
-    # Use Responses API (preferred over chat.completions)
-    resp = openai_client.responses.create(
-        model=model,
-        input=command,
-        instructions=system_prompt,
-    )
+    # Prefer Responses API if available; else fallback to chat.completions
+    if hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
+        resp = openai_client.responses.create(
+            model=model,
+            input=command,
+            instructions=system_prompt,
+        )
 
-    # Prefer convenience attribute if available
-    text = None
-    try:
-        text = getattr(resp, "output_text", None)
-    except Exception:
+        # Prefer convenience attribute if available
         text = None
-    if text:
-        return text
+        try:
+            text = getattr(resp, "output_text", None)
+        except Exception:
+            text = None
+        if text:
+            return text
 
-    # Fallback: concatenate text parts from structured output
-    try:
-        parts = []
-        for item in getattr(resp, "output", []) or []:
-            for c in getattr(item, "content", []) or []:
-                t = getattr(c, "text", None)
-                if t:
-                    parts.append(t)
-        if parts:
-            return "".join(parts)
-    except Exception:
-        pass
+        # Fallback: concatenate text parts from structured output
+        try:
+            parts = []
+            for item in getattr(resp, "output", []) or []:
+                for c in getattr(item, "content", []) or []:
+                    t = getattr(c, "text", None)
+                    if t:
+                        parts.append(t)
+            if parts:
+                return "".join(parts)
+        except Exception:
+            pass
 
-    # Last resort: stringify the response
-    return str(resp)
+        # Last resort: stringify the response
+        return str(resp)
+    else:
+        # Fallback: non-streaming chat completion
+        try:
+            resp = openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": command},
+                ],
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            return f"Error: {e}"
 
 
 def _fetch_recent_messages_for_chat(chat_guid: str, limit: int = 10) -> list[dict]:
@@ -534,41 +552,88 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid
 
     ctx = dict(emit_ctx or {})
     text_parts: list[str] = []
-    try:
-        # Stream events from the Responses API
-        with openai_client.responses.stream(
-            model=model,
-            input=input_text,
-            instructions=system_prompt,
-        ) as stream:
-            for event in stream:
-                try:
-                    if getattr(event, "type", "") == "response.output_text.delta":
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            text_parts.append(delta)
-                            if socketio:
-                                payload = {"delta": delta}
-                                payload.update(ctx)
-                                socketio.emit("ai_stream", payload)
-                except Exception:
-                    # Ignore malformed events but continue streaming
-                    continue
+    # Prefer Responses API streaming if available
+    if hasattr(openai_client, "responses") and getattr(openai_client, "responses") is not None:
+        try:
+            with openai_client.responses.stream(
+                model=model,
+                input=input_text,
+                instructions=system_prompt,
+            ) as stream:
+                for event in stream:
+                    try:
+                        if getattr(event, "type", "") == "response.output_text.delta":
+                            delta = getattr(event, "delta", None)
+                            if delta:
+                                text_parts.append(delta)
+                                if socketio:
+                                    payload = {"delta": delta}
+                                    payload.update(ctx)
+                                    socketio.emit("ai_stream", payload)
+                    except Exception:
+                        continue
 
-            # Try to obtain final text from helper or fallback to collected parts
-            final_text = None
-            try:
-                final_text = getattr(stream, "get_final_text", lambda: None)()
-            except Exception:
+                # Try to obtain final text from helper or fallback to collected parts
                 final_text = None
-            if not final_text:
-                final_text = "".join(text_parts)
+                try:
+                    final_text = getattr(stream, "get_final_text", lambda: None)()
+                except Exception:
+                    final_text = None
+                if not final_text:
+                    final_text = "".join(text_parts)
 
+                if socketio:
+                    done_payload = {"done": True, "text": final_text}
+                    done_payload.update(ctx)
+                    socketio.emit("ai_stream", done_payload)
+                return final_text
+        except Exception as e:
             if socketio:
-                done_payload = {"done": True, "text": final_text}
-                done_payload.update(ctx)
-                socketio.emit("ai_stream", done_payload)
-            return final_text
+                err_payload = {"error": str(e)}
+                err_payload.update(ctx)
+                socketio.emit("ai_stream", err_payload)
+            return f"Error: {e}"
+
+    # Fallback: stream via chat.completions if Responses API is unavailable
+    try:
+        stream = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": input_text},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            try:
+                delta = None
+                choices = getattr(chunk, "choices", None)
+                if choices:
+                    delta = getattr(choices[0].delta, "content", None)
+                if delta:
+                    text_parts.append(delta)
+                    if socketio:
+                        payload = {"delta": delta}
+                        payload.update(ctx)
+                        socketio.emit("ai_stream", payload)
+            except Exception:
+                continue
+        final_text = "".join(text_parts)
+        if not final_text:
+            # As a final fallback, request non-streaming
+            resp = openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": input_text},
+                ],
+            )
+            final_text = resp.choices[0].message.content
+        if socketio:
+            done_payload = {"done": True, "text": final_text}
+            done_payload.update(ctx)
+            socketio.emit("ai_stream", done_payload)
+        return final_text
     except Exception as e:
         if socketio:
             err_payload = {"error": str(e)}

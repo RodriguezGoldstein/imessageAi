@@ -56,8 +56,8 @@ doctor:
 	reqs = [
 	    'flask==3.0.3',
 	    'flask_socketio==5.3.6',
-	    'openai==1.37.0',
-	    'httpx==0.27.2',
+	    'openai>=1.44.0',
+	    'httpx>=0.27',
 	    'pytypedstream==0.1.0',
 	    'schedule==1.2.1',
 	]
