@@ -131,6 +131,17 @@ def update_ai_settings():
         sp = (request.form.get("system_prompt", "") or "").strip()
         if sp:
             agent.ai_settings["system_prompt"] = sp
+    if "context_window" in request.form:
+        cw_raw = (request.form.get("context_window", "") or "").strip()
+        try:
+            cw = int(cw_raw)
+            if cw < 1:
+                cw = 1
+            if cw > 100:
+                cw = 100
+            agent.ai_settings["context_window"] = cw
+        except Exception:
+            pass
     agent.save_ai_settings()
     return "AI Settings Updated!", 200
 
@@ -143,6 +154,7 @@ def get_allowlist():
         "allowed_users": agent.ai_settings.get("allowed_users", []),
         "openai_model": agent.ai_settings.get("openai_model", "gpt-4o-mini"),
         "system_prompt": agent.ai_settings.get("system_prompt", "You are a concise, helpful assistant. Keep answers brief."),
+        "context_window": agent.ai_settings.get("context_window", 25),
     })
 
 

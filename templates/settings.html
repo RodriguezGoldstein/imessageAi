@@ -38,6 +38,10 @@
                 </label>
                 <label>System Prompt:</label>
                 <textarea name="system_prompt" rows="3" placeholder="You are a concise, helpful assistant. Keep answers brief.">{{ ai_settings.get('system_prompt', 'You are a concise, helpful assistant. Keep answers brief.') }}</textarea>
+                <h3>Context Window</h3>
+                <label>Number of recent messages to include (1–100):
+                    <input type="number" min="1" max="100" name="context_window" value="{{ ai_settings.get('context_window', 25) }}" />
+                </label>
                 <button type="submit">Save General Settings</button>
             </form>
         </div>

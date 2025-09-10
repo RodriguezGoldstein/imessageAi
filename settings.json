@@ -2,8 +2,9 @@
     "ai_trigger_tag": "@ai",
     "openai_model": "gpt-5-nano",
     "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
+    "context_window": 25,
     "allowed_users": [],
     "allowed_users_encrypted": [
-        "gAAAAABowN27hkPxWNNebr0N0c4uE6TCnuxVTJOP7myOJ2VfUd3aR4k9-O9t_v8cXq4egR_DbrLbTivv1oYFE69pxXBCvEhyzQ=="
+        "gAAAAABowORr8V5p6xod0zMbbM2kKAPUdkWEp4h4b4o1sf88JkD21h2feGWH1yRPcB-MLHldgEOkGfmfrKSREJ0dYoEoLQgSVg=="
     ]
 }

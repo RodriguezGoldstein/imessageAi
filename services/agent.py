@@ -138,6 +138,8 @@ if "openai_model" not in ai_settings:
     ai_settings["openai_model"] = "gpt-4o-mini"
 if "system_prompt" not in ai_settings:
     ai_settings["system_prompt"] = "You are a concise, helpful assistant. Keep answers brief."
+if "context_window" not in ai_settings:
+    ai_settings["context_window"] = 25
 if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
     # Decrypt into memory for runtime use
     try:
@@ -389,8 +391,9 @@ def save_ai_settings():
         allowed_plain = sorted({normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x})
         ai_settings["allowed_users"] = allowed_plain
     payload = {**ai_settings}
+    # Keep both encrypted and plaintext to ensure persistence across sessions/sections
     payload["allowed_users_encrypted"] = encrypt_list(allowed_plain)
-    payload["allowed_users"] = []
+    payload["allowed_users"] = allowed_plain
     with open(SETTINGS_FILE, "w") as file:
         json.dump(payload, file, indent=4)
 
@@ -447,7 +450,65 @@ def query_openai_direct(command: str) -> str:
     return str(resp)
 
 
-def query_openai_stream(command: str, emit_ctx: dict | None = None) -> str:
+def _fetch_recent_messages_for_chat(chat_guid: str, limit: int = 10) -> list[dict]:
+    """Return last N messages for a chat GUID (most recent first in DB, returned oldest→newest)."""
+    if not chat_guid:
+        return []
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT m.is_from_me, h.id AS address, m.attributedBody, m.text, m.date
+            FROM message AS m
+            LEFT JOIN handle AS h ON h.rowid = m.handle_id
+            INNER JOIN chat_message_join AS cmj ON cmj.message_id = m.rowid
+            INNER JOIN chat AS c ON c.rowid = cmj.chat_id
+            WHERE c.guid = ?
+            ORDER BY m.date DESC
+            LIMIT ?
+            """,
+            (chat_guid, int(limit)),
+        )
+        rows = cur.fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    out = []
+    for (is_from_me, address, attributedBody, plain_text, date_raw) in reversed(rows or []):
+        try:
+            body = typedstream.unarchive_from_data(attributedBody).contents[0].value.value if attributedBody else (plain_text or "")
+        except Exception:
+            body = plain_text or ""
+        out.append({
+            "is_from_me": int(is_from_me or 0),
+            "address": normalize_handle(address),
+            "text": (body or "").strip(),
+            "date_raw": date_raw,
+        })
+    return out
+
+
+def _format_context_for_model(history: list[dict], requester: str | None, limit: int) -> str:
+    """Format recent messages as readable context for the model."""
+    lines = [f"Conversation history (latest {int(limit)} messages):"]
+    for item in history or []:
+        if not item.get("text"):
+            continue
+        speaker = "Me" if item.get("is_from_me") else (item.get("address") or "Participant")
+        lines.append(f"- {speaker}: {item.get('text')}")
+    if requester:
+        lines.append("")
+        lines.append(f"Requester: {requester}")
+    lines.append("")
+    lines.append("Respond to the latest user message. Keep it concise.")
+    return "\n".join(lines)
+
+
+def query_openai_stream(command: str, emit_ctx: dict | None = None, *, chat_guid: str | None = None, requester: str | None = None) -> str:
     """Stream a response via the Responses API and emit deltas over Socket.IO.
 
     Returns the final concatenated text.
@@ -456,6 +517,20 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None) -> str:
         return ""
     model = (ai_settings.get("openai_model") or "gpt-4o-mini").strip()
     system_prompt = ai_settings.get("system_prompt") or "You are a concise, helpful assistant. Keep answers brief."
+    # Determine context window size
+    try:
+        window = int(ai_settings.get("context_window", 25))
+    except Exception:
+        window = 25
+    if window < 1:
+        window = 1
+    if window > 100:
+        window = 100
+
+    context_text = _format_context_for_model(_fetch_recent_messages_for_chat(chat_guid, limit=window) if chat_guid else [], requester, window)
+
+    # Build combined input with context + user request
+    input_text = (context_text.strip() + "\n\nUser request: " + command.strip()).strip()
 
     ctx = dict(emit_ctx or {})
     text_parts: list[str] = []
@@ -463,7 +538,7 @@ def query_openai_stream(command: str, emit_ctx: dict | None = None) -> str:
         # Stream events from the Responses API
         with openai_client.responses.stream(
             model=model,
-            input=command,
+            input=input_text,
             instructions=system_prompt,
         ) as stream:
             for event in stream:
@@ -544,7 +619,7 @@ def monitor_db_polling_general():
             if allowed and cmd:
                 try:
                     emit_ctx = {"phone": phone_number, "chat_type": chat_type, "chat_guid": chat_guid}
-                    ai_reply = query_openai_stream(cmd, emit_ctx)
+                    ai_reply = query_openai_stream(cmd, emit_ctx, chat_guid=chat_guid, requester=phone_number)
                 except Exception as e:
                     ai_reply = f"Error: {e}"
 

@@ -25,7 +25,7 @@ This project is focused on privacy and explicit control: the agent never auto-re
 - Agent core: `services/agent.py` polls `~/Library/Messages/chat.db` for new messages and sends replies with AppleScript.
 - UI: `templates/dashboard.html` for live feed; `templates/settings.html` for trigger + allowlist management.
 - Data:
-  - `settings.json` – stores `ai_trigger_tag`, `openai_model`, `system_prompt`, and the allowlist (encrypted at rest).
+  - `settings.json` – stores `ai_trigger_tag`, `openai_model`, `system_prompt`, `context_window`, and the allowlist (encrypted at rest).
 
 ## Requirements
 
@@ -96,6 +96,7 @@ PY
   "ai_trigger_tag": "@ai",
   "openai_model": "gpt-4o-mini",
   "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
+  "context_window": 25,
   "allowed_users": ["+11234567890"]
 }
 ```
@@ -202,6 +203,11 @@ curl -X POST http://127.0.0.1:5000/api/send \
 - Default in this repo: `gpt-4o-mini` for low-latency, low-cost replies.
 - You can set the model and system prompt in Settings or by editing `settings.json`.
 - If you prefer higher quality, set `openai_model` to `gpt-4o`.
+
+## Context window
+
+- The agent includes recent conversation context when answering `@ai` requests.
+- Configure the number of recent messages with `context_window` (default 25, range 1–100) in Settings or `settings.json`.
 
 ## Service Setup (launchd)
 
