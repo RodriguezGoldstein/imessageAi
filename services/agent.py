@@ -381,6 +381,7 @@ def fetch_new_messages_all():
             "service": service,
             "chat_guid": chat_guid,
             "chat_type": chat_type,
+            "is_from_me": int(is_from_me or 0),
         })
 
     return messages
@@ -1499,6 +1500,7 @@ def monitor_db_polling_general():
             chat_guid = item.get("chat_guid")
             chat_type = item.get("chat_type")
             date_raw = item.get("date_raw")
+            is_from_me = int(item.get("is_from_me") or 0)
 
             if not phone_number or not message:
                 continue
@@ -1510,10 +1512,14 @@ def monitor_db_polling_general():
             if socketio:
                 socketio.emit("new_message", {"phone": phone_number, "message": message, "chat_type": chat_type, "chat_guid": chat_guid})
 
+            # Only react to inbound messages (not our own sends)
+            if is_from_me:
+                continue
+
             # Check trigger and allowlist
             cmd = extract_trigger_command(message, ai_settings.get("ai_trigger_tag", "@ai"))
             if cmd:
-                print(f"🔎 Trigger detected. Sender={phone_number} Cmd='{cmd}'")
+                print(f"🔎 Trigger detected. Sender={phone_number} Cmd='{cmd}' chat_type={chat_type} chat_guid={chat_guid}")
             allowed = phone_number in ai_settings.get("allowed_users", [])
             if not allowed and cmd:
                 print(f"⛔ Ignoring trigger: sender not in allowlist. Allowed={ai_settings.get('allowed_users', [])}")
