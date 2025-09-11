@@ -142,6 +142,18 @@ def update_ai_settings():
             agent.ai_settings["context_window"] = cw
         except Exception:
             pass
+    # Vision settings
+    if "image_chunk_size" in request.form:
+        ics_raw = (request.form.get("image_chunk_size", "") or "").strip()
+        try:
+            ics = int(ics_raw)
+            if ics < 1:
+                ics = 1
+            if ics > 20:
+                ics = 20
+            agent.ai_settings["image_chunk_size"] = ics
+        except Exception:
+            pass
     # Search settings (Tavily)
     if "enable_search" in request.form:
         agent.ai_settings["enable_search"] = True
@@ -172,6 +184,7 @@ def get_allowlist():
         "openai_model": agent.ai_settings.get("openai_model", "gpt-4o-mini"),
         "system_prompt": agent.ai_settings.get("system_prompt", "You are a concise, helpful assistant. Keep answers brief."),
         "context_window": agent.ai_settings.get("context_window", 25),
+        "image_chunk_size": agent.ai_settings.get("image_chunk_size", 5),
         "enable_search": agent.ai_settings.get("enable_search", False),
         "search_max_results": agent.ai_settings.get("search_max_results", 5),
     })

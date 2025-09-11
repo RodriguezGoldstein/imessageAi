@@ -84,6 +84,16 @@ scheduled_messages = []
 
 # Track recent messages we sent (to avoid treating them as user triggers)
 _recent_sends = defaultdict(lambda: deque(maxlen=20))  # key -> deque[(text, ts)]
+def _get_image_chunk_size() -> int:
+    try:
+        n = int(ai_settings.get("image_chunk_size", 5))
+    except Exception:
+        n = 5
+    if n < 1:
+        n = 1
+    if n > 20:
+        n = 20
+    return n
 
 def _record_sent(key: str, text: str):
     try:
@@ -177,6 +187,8 @@ if "search_max_results" not in ai_settings:
     ai_settings["search_max_results"] = 5
 if "search_cache_ttl" not in ai_settings:
     ai_settings["search_cache_ttl"] = 120
+if "image_chunk_size" not in ai_settings:
+    ai_settings["image_chunk_size"] = 5
 
 # In-memory cache for web search results: { (normalized_query, k): (ts, results) }
 _search_cache = {}
@@ -897,8 +909,11 @@ def _is_pdf_row(uti: Optional[str], mime: Optional[str], filename: Optional[str]
     return False
 
 
-def _find_recent_image_attachments(chat_guid: str, before_date: Optional[int] = None, max_images: int = 3) -> List[str]:
-    """Return up to max_images absolute file paths for recent image attachments in a chat."""
+def _find_recent_image_attachments(chat_guid: str, before_date: Optional[int] = None, max_images: Optional[int] = 3) -> List[str]:
+    """Return absolute file paths for recent image attachments in a chat.
+
+    If max_images is None or <= 0, returns all found up to a generous SQL LIMIT.
+    """
     if not chat_guid:
         return []
     try:
@@ -915,7 +930,7 @@ def _find_recent_image_attachments(chat_guid: str, before_date: Optional[int] = 
                 INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
                 WHERE c.guid = ?
                 ORDER BY m.date DESC
-                LIMIT 50
+                LIMIT 300
                 """,
                 (chat_guid,),
             )
@@ -930,7 +945,7 @@ def _find_recent_image_attachments(chat_guid: str, before_date: Optional[int] = 
                 INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
                 WHERE c.guid = ? AND m.date <= ?
                 ORDER BY m.date DESC
-                LIMIT 50
+                LIMIT 300
                 """,
                 (chat_guid, int(before_date)),
             )
@@ -951,14 +966,14 @@ def _find_recent_image_attachments(chat_guid: str, before_date: Optional[int] = 
                 fp = os.path.expanduser(filename)
                 if os.path.exists(fp):
                     paths.append(fp)
-                if len(paths) >= max_images:
+                if max_images and max_images > 0 and len(paths) >= max_images:
                     break
             except Exception:
                 continue
     return paths
 
 
-def _find_recent_pdf_attachments(chat_guid: str, before_date: Optional[int] = None, max_docs: int = 3) -> List[str]:
+def _find_recent_pdf_attachments(chat_guid: str, before_date: Optional[int] = None, max_docs: Optional[int] = 3) -> List[str]:
     if not chat_guid:
         return []
     try:
@@ -975,7 +990,7 @@ def _find_recent_pdf_attachments(chat_guid: str, before_date: Optional[int] = No
                 INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
                 WHERE c.guid = ?
                 ORDER BY m.date DESC
-                LIMIT 50
+                LIMIT 300
                 """,
                 (chat_guid,),
             )
@@ -990,7 +1005,7 @@ def _find_recent_pdf_attachments(chat_guid: str, before_date: Optional[int] = No
                 INNER JOIN attachment AS a ON a.rowid = maj.attachment_id
                 WHERE c.guid = ? AND m.date <= ?
                 ORDER BY m.date DESC
-                LIMIT 50
+                LIMIT 300
                 """,
                 (chat_guid, int(before_date)),
             )
@@ -1010,7 +1025,7 @@ def _find_recent_pdf_attachments(chat_guid: str, before_date: Optional[int] = No
                 fp = os.path.expanduser(filename)
                 if os.path.exists(fp):
                     paths.append(fp)
-                if len(paths) >= max_docs:
+                if max_docs and max_docs > 0 and len(paths) >= max_docs:
                     break
             except Exception:
                 continue
@@ -1075,6 +1090,38 @@ def describe_images_with_openai(image_paths: List[str], instruction: Optional[st
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         return f"Error describing image: {e}"
+
+
+def _chunk_list(items: List[str], size: int) -> List[List[str]]:
+    if not items:
+        return []
+    if size <= 0:
+        return [items]
+    return [items[i:i+size] for i in range(0, len(items), size)]
+
+
+def describe_images_with_openai_chunks(image_paths: List[str], instruction: Optional[str] = None, chunk_size: Optional[int] = None) -> str:
+    """Describe many images by chunking into smaller batches and concatenating results."""
+    if not image_paths:
+        return ""
+    cs = chunk_size if (chunk_size and chunk_size > 0) else _get_image_chunk_size()
+    chunks = _chunk_list(image_paths, max(1, int(cs)))
+    parts = []
+    total = len(chunks)
+    for idx, ch in enumerate(chunks, 1):
+        s = describe_images_with_openai(ch, instruction=instruction)
+        if s:
+            if total > 1:
+                parts.append(f"Part {idx}/{total}:\n{s}")
+            else:
+                parts.append(s)
+    combined = "\n\n".join(parts)
+    # Add a final overall summary to tie parts together
+    if combined:
+        overall = summarize_text_with_openai(combined, instruction=(instruction or "") + "\n\nProvide a concise overall summary (2-3 sentences) of the images as a whole.")
+        if overall:
+            return combined + "\n\n" + "Overall summary: " + overall
+    return combined
 
 
 def extract_text_from_pdf(path: str, max_chars: int = 30000) -> str:
@@ -1189,20 +1236,19 @@ def summarize_pdfs_with_openai_file_refs(paths: List[str], instruction: Optional
         return f"Error summarizing document: {e}"
 
 
-def _infer_requested_image_count(text: str, default: int = 1) -> int:
-    """Infer how many images the user asked to consider. Defaults to 1 (latest).
+def _infer_requested_image_count(text: str, default: int = 1) -> Optional[int]:
+    """Infer how many items the user asked to consider.
 
-    Recognizes simple numeric mentions (e.g., "last 3"), and keywords like
-    "both", "couple" (2), "few"/"several"/"more pictures" (3), and "all" (up to 5).
-    Caps between 1 and 5.
+    Returns None to mean "no limit" (process all recent items) when text asks for "all".
+    Otherwise returns a capped integer >= 1.
     """
     try:
         t = (text or "").lower()
         if not t:
-            return max(1, min(default, 5))
+            return max(1, default)
         # Keywords
-        if "all" in t:
-            return 5
+        if "all" in t or "every" in t or "entire" in t:
+            return None  # unlimited
         if any(k in t for k in ("both", "couple")):
             return 2
         if any(k in t for k in ("few", "several", "more picture", "more images", "more pics", "recent pictures", "recent images")):
@@ -1214,19 +1260,19 @@ def _infer_requested_image_count(text: str, default: int = 1) -> int:
         }
         for w, n in words_map.items():
             if w in t:
-                return max(1, min(n, 5))
+                return max(1, n)
         # Digits anywhere
         import re
         m = re.search(r"(\d+)", t)
         if m:
             try:
                 n = int(m.group(1))
-                return max(1, min(n, 5))
+                return max(1, n)
             except Exception:
                 pass
-        return max(1, min(default, 5))
+        return max(1, default)
     except Exception:
-        return max(1, min(default, 5))
+        return max(1, default)
 
 
 def _is_search_configured() -> bool:
@@ -1539,15 +1585,19 @@ def monitor_db_polling_general():
             date_raw = item.get("date_raw")
             is_from_me = int(item.get("is_from_me") or 0)
 
-            if not phone_number or not message:
+            if not message:
+                continue
+            # Allow self/group messages where address may be NULL; require at least chat_guid
+            if not phone_number and not chat_guid:
                 continue
 
-            print(f"📩 New message from {phone_number}: {message}")
-            log_message(phone_number, message, "Received")
+            sender_label = phone_number or ("Me" if is_from_me else "")
+            print(f"📩 New message from {sender_label}: {message}")
+            log_message(sender_label or (chat_guid or ""), message, "Received")
 
             # Emit raw message update
             if socketio:
-                socketio.emit("new_message", {"phone": phone_number, "message": message, "chat_type": chat_type, "chat_guid": chat_guid})
+                socketio.emit("new_message", {"phone": sender_label or phone_number or chat_guid, "message": message, "chat_type": chat_type, "chat_guid": chat_guid})
 
             # Check trigger first, with debug when message contains '@'
             tag = ai_settings.get("ai_trigger_tag", "@ai")
@@ -1585,16 +1635,21 @@ def monitor_db_polling_general():
                     ai_reply = None
                     if chat_guid and wants_image_desc:
                         max_imgs = _infer_requested_image_count(cmd, default=1)
-                        img_paths = _find_recent_image_attachments(chat_guid, before_date=date_raw, max_images=max_imgs)
+                        img_paths = _find_recent_image_attachments(chat_guid, before_date=date_raw, max_images=max_imgs if max_imgs else None)
                         if img_paths:
                             print(f"🖼 Describing {len(img_paths)} image(s) for chat {chat_guid}")
-                            ai_reply = describe_images_with_openai(img_paths, instruction=cmd)
+                            # Chunk when many images
+                            chunk_sz = _get_image_chunk_size()
+                            if len(img_paths) > chunk_sz:
+                                ai_reply = describe_images_with_openai_chunks(img_paths, instruction=cmd, chunk_size=chunk_sz)
+                            else:
+                                ai_reply = describe_images_with_openai(img_paths, instruction=cmd)
                     elif chat_guid and wants_pdf_summary:
                         max_docs = _infer_requested_image_count(cmd, default=1)
-                        pdf_paths = _find_recent_pdf_attachments(chat_guid, before_date=date_raw, max_docs=max_docs)
+                        pdf_paths = _find_recent_pdf_attachments(chat_guid, before_date=date_raw, max_docs=max_docs if max_docs else None)
                         if pdf_paths:
                             print(f"📄 Summarizing {len(pdf_paths)} PDF(s) for chat {chat_guid}")
-                            if max_docs == 1 or len(pdf_paths) == 1:
+                            if (max_docs == 1) or (len(pdf_paths) == 1):
                                 only_path = pdf_paths[0]
                                 only_name = os.path.basename(only_path)
                                 s = summarize_pdfs_with_openai_file_refs([only_path], instruction=cmd)
