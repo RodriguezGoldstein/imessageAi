@@ -304,4 +304,15 @@ if __name__ == "__main__":
         thread_monitor = threading.Thread(target=agent.monitor_db_polling_general, daemon=True)
         thread_monitor.start()
 
-    socketio.run(app, host="127.0.0.1", port=5000, debug=True, use_reloader=False)
+    # Werkzeug dev server safety gate (Flask 2.3+/3.x):
+    # When running under nohup/production-like contexts, Flask/Flask-SocketIO
+    # raises unless explicitly allowed. This app uses the built-in server for
+    # local use, so allow it here.
+    socketio.run(
+        app,
+        host="127.0.0.1",
+        port=5000,
+        debug=True,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+    )
