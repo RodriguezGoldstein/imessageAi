@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import subprocess
+import threading
 import time
 import schedule
 import re
@@ -15,31 +16,34 @@ from pathlib import Path
 import PyPDF2
 import base64
 import mimetypes
-from cryptography.fernet import Fernet
+import uuid
 from tavily import TavilyClient
 from collections import defaultdict, deque
 
+from services.config import (
+    Config,
+    load_config,
+    APP_SUPPORT_DIR,
+    STATE_FILE,
+    TMP_IMAGES_DIR,
+    decrypt_list,
+)
 
-# OpenAI API Key (env only)
-OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
+
+# Lazy-initialized runtime config; populated when `Agent` is constructed.
+_runtime_config: Optional[Config] = None
+
+# OpenAI client is bound at Agent construction time.
+openai_client: Optional[OpenAI] = None
 
 # macOS iMessage database path
 CHAT_DB = os.path.expanduser("~/Library/Messages/chat.db")
-
-# App support/state path (persist last_seen_date)
-APP_SUPPORT_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "imessage-ai")
-TMP_IMAGES_DIR = os.path.join(APP_SUPPORT_DIR, "tmp_images")
-STATE_FILE = os.path.join(APP_SUPPORT_DIR, "state.json")
 
 # Flask SocketIO instance
 socketio = None
 
 # Track last seen message date (raw Apple epoch)
 last_seen_date = 0
-
-# Load AI settings from JSON
-SETTINGS_FILE = "settings.json"
 
 # Contacts no longer sourced from CSV; keep an empty map for display/logging.
 contacts = {}
@@ -84,6 +88,22 @@ scheduled_messages = []
 
 # Track recent messages we sent (to avoid treating them as user triggers)
 _recent_sends = defaultdict(lambda: deque(maxlen=20))  # key -> deque[(text, ts)]
+_scheduler = schedule.Scheduler()
+_stop_event = threading.Event()
+
+
+def _run_applescript(script: str, *, capture_output: bool = False) -> subprocess.CompletedProcess:
+    """Execute the provided AppleScript, normalizing error handling/logging."""
+
+    args = ["osascript", "-e", script]
+    kwargs: Dict[str, Any] = {"check": True}
+    if capture_output:
+        kwargs.update({"capture_output": True, "text": True})
+    try:
+        return subprocess.run(args, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        print(f"❌ AppleScript error: {exc}")
+        raise
 def _get_image_chunk_size() -> int:
     try:
         n = int(ai_settings.get("image_chunk_size", 5))
@@ -112,62 +132,8 @@ def _was_recently_sent_by_bot(key: str, text: str, window_secs: int = 30) -> boo
     return False
 
 
-# Default settings (minimal)
-if os.path.exists(SETTINGS_FILE):
-    with open(SETTINGS_FILE, "r") as file:
-        ai_settings = json.load(file)
-else:
-    ai_settings = {}
-
-# Encryption helpers for allowlist at rest
-KEY_FILE = os.path.join(APP_SUPPORT_DIR, "secret.key")
-
-
-def _get_or_create_key() -> bytes:
-    _ensure_app_support_dir()
-    try:
-        if os.path.exists(KEY_FILE):
-            with open(KEY_FILE, 'rb') as f:
-                return f.read()
-    except Exception as e:
-        print(f"⚠️ Failed reading key: {e}")
-    key = Fernet.generate_key()
-    try:
-        with open(KEY_FILE, 'wb') as f:
-            f.write(key)
-    except Exception as e:
-        print(f"⚠️ Failed writing key file: {e}")
-    return key
-
-
-def _fernet() -> Fernet:
-    return Fernet(_get_or_create_key())
-
-
-def encrypt_list(items: List[str]) -> List[str]:
-    f = _fernet()
-    out = []
-    for it in items or []:
-        if not it:
-            continue
-        token = f.encrypt(it.encode('utf-8')).decode('utf-8')
-        out.append(token)
-    return out
-
-
-def decrypt_list(tokens: List[str]) -> List[str]:
-    f = _fernet()
-    out = []
-    for tok in tokens or []:
-        if not tok:
-            continue
-        try:
-            val = f.decrypt(tok.encode('utf-8')).decode('utf-8')
-            out.append(val)
-        except Exception:
-            continue
-    return out
-
+# AI settings are bound to the runtime config during Agent initialization.
+ai_settings: Dict[str, Any] = {}
 
 # Ensure generalized agent settings exist
 if "ai_trigger_tag" not in ai_settings:
@@ -192,29 +158,18 @@ if "image_chunk_size" not in ai_settings:
 
 # In-memory cache for web search results: { (normalized_query, k): (ts, results) }
 _search_cache = {}
-if "allowed_users_encrypted" in ai_settings and not ai_settings.get("allowed_users"):
-    # Decrypt into memory for runtime use
+allowed_users_encrypted = ai_settings.get("allowed_users_encrypted")
+if allowed_users_encrypted and not ai_settings.get("allowed_users"):
     try:
-        allowed_plain = decrypt_list(ai_settings.get("allowed_users_encrypted", []))
-        ai_settings["allowed_users"] = sorted({normalize_handle(x) for x in allowed_plain if x})
+        ai_settings["allowed_users"] = sorted({
+            normalize_handle(x) for x in decrypt_list(allowed_users_encrypted) if x
+        })
     except Exception:
         ai_settings["allowed_users"] = []
-elif "allowed_users" not in ai_settings:
-    ai_settings["allowed_users"] = []
-    # Persist initial encrypted state
-    try:
-        with open(SETTINGS_FILE, "w") as file:
-            json.dump({
-                **ai_settings,
-                "allowed_users_encrypted": encrypt_list(ai_settings.get("allowed_users", [])),
-                "allowed_users": []  # do not persist plaintext
-            }, file, indent=4)
-    except Exception:
-        pass
-
-"""Normalize existing allowlist on load (plaintext in memory only)."""
-if isinstance(ai_settings.get("allowed_users"), list):
-    ai_settings["allowed_users"] = sorted({normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x})
+elif isinstance(ai_settings.get("allowed_users"), list):
+    ai_settings["allowed_users"] = sorted({
+        normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x
+    })
 
 
 def _ensure_app_support_dir():
@@ -230,12 +185,17 @@ def _ensure_app_support_dir():
 
 
 def _load_state():
-    global last_seen_date
+    global last_seen_date, message_log, scheduled_messages
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 data = json.load(f)
                 last_seen_date = int(data.get('last_seen_date', 0))
+                if isinstance(data.get('message_log'), list):
+                    message_log[:] = data.get('message_log')[-250:]
+                if isinstance(data.get('scheduled_messages'), list):
+                    scheduled_messages[:] = data.get('scheduled_messages')
+                _restore_scheduled_jobs()
     except Exception as e:
         print(f"⚠️ Failed to load state: {e}")
 
@@ -244,7 +204,11 @@ def _save_state():
     try:
         _ensure_app_support_dir()
         with open(STATE_FILE, 'w') as f:
-            json.dump({"last_seen_date": last_seen_date}, f)
+            json.dump({
+                "last_seen_date": last_seen_date,
+                "message_log": message_log[-250:],
+                "scheduled_messages": scheduled_messages,
+            }, f, indent=2)
     except Exception as e:
         print(f"⚠️ Failed to save state: {e}")
 
@@ -317,7 +281,7 @@ def send_message(message: str, phone_number: str = None, chat_guid: str = None):
         emit_ctx = {"chat_type": "Individual", "chat_guid": None}
 
     try:
-        subprocess.run(["osascript", "-e", script], check=True)
+        _run_applescript(script)
         print(f"✅ Sent message to {target_desc}: {message}")
     except subprocess.CalledProcessError as e:
         print(f"❌ Error sending message: {e}")
@@ -437,6 +401,7 @@ def log_message(phone, message, direction):
         "message": message,
         "direction": direction
     })
+    _save_state()
     if socketio:
         socketio.emit("update_analytics", message_log)
 
@@ -447,23 +412,65 @@ def log_message(phone, message, direction):
 ### 📌 Function: Schedule Messages ###
 def schedule_messages():
     """Schedules automated messages at specific times."""
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
-        
+    while not _stop_event.is_set():
+        _scheduler.run_pending()
+        _stop_event.wait(30)
+
+
+def add_scheduled_message_entry(time_str: str, phone: str, message: str) -> Dict[str, Any]:
+    entry = {
+        "id": str(uuid.uuid4()),
+        "time": time_str,
+        "phone": phone,
+        "message": message,
+    }
+    scheduled_messages.append(entry)
+    try:
+        _scheduler.every().day.at(time_str).do(send_imessage, phone, message).tag(entry["id"])
+    except schedule.ScheduleValueError as exc:
+        scheduled_messages.remove(entry)
+        raise exc
+    _save_state()
+    return entry
+
+
+def _restore_scheduled_jobs():
+    try:
+        _scheduler.clear()
+    except Exception:
+        pass
+    for entry in list(scheduled_messages):
+        time_str = entry.get("time")
+        phone = entry.get("phone")
+        message = entry.get("message")
+        if not time_str or not message or not phone:
+            continue
+        try:
+            _scheduler.every().day.at(time_str).do(send_imessage, phone, message).tag(entry.get("id", str(uuid.uuid4())))
+        except schedule.ScheduleValueError:
+            continue
+
+
+def remove_scheduled_message_entry(entry_id: str) -> bool:
+    for idx, entry in enumerate(list(scheduled_messages)):
+        if entry.get("id") == entry_id:
+            scheduled_messages.pop(idx)
+            try:
+                _scheduler.clear(entry_id)
+            except Exception:
+                pass
+            _save_state()
+            return True
+    return False
+
 
 def save_ai_settings():
-    # Normalize and persist encrypted allowlist; do not write plaintext to disk
-    allowed_plain = []
     if isinstance(ai_settings.get("allowed_users"), list):
-        allowed_plain = sorted({normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x})
-        ai_settings["allowed_users"] = allowed_plain
-    payload = {**ai_settings}
-    # Keep both encrypted and plaintext to ensure persistence across sessions/sections
-    payload["allowed_users_encrypted"] = encrypt_list(allowed_plain)
-    payload["allowed_users"] = allowed_plain
-    with open(SETTINGS_FILE, "w") as file:
-        json.dump(payload, file, indent=4)
+        ai_settings["allowed_users"] = sorted({
+            normalize_handle(x) for x in ai_settings.get("allowed_users", []) if x
+        })
+    if _runtime_config is not None:
+        _runtime_config.save()
 
 
 ### 📌 Helper: Extract @ai command ###
@@ -657,7 +664,7 @@ def _lookup_contact_name_via_contacts_app(handle: str) -> Optional[str]:
     end if
     '''
     try:
-        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=True)
+        res = _run_applescript(script, capture_output=True)
         name = (res.stdout or "").strip()
         if name:
             _contact_name_cache[key] = name
@@ -1573,7 +1580,7 @@ def monitor_db_polling_general():
     _load_state()
     _init_last_seen_if_needed()
 
-    while True:
+    while not _stop_event.is_set():
         new_items = fetch_new_messages_all()
 
         for item in new_items:
@@ -1709,7 +1716,8 @@ def monitor_db_polling_general():
                             "chat_guid": chat_guid
                         })
 
-        time.sleep(5)
+        if _stop_event.wait(5):
+            break
 
 
 def check_db_reachability():
@@ -1723,3 +1731,94 @@ def check_db_reachability():
         return True, None
     except Exception as e:
         return False, str(e)
+
+
+class Agent:
+    """Encapsulates the runtime agent lifecycle and configuration binding."""
+
+    def __init__(self, config: Optional[Config] = None) -> None:
+        global _runtime_config, ai_settings, openai_client
+
+        self.config = config or load_config()
+        _runtime_config = self.config
+
+        ai_settings = self.config.ai_settings
+        openai_client = OpenAI(api_key=self.config.openai_api_key) if self.config.openai_api_key else OpenAI()
+
+        _ensure_app_support_dir()
+        _load_state()
+        self.contacts = contacts
+        self._threads: List[threading.Thread] = []
+
+    # ------------------------------------------------------------------
+    # Socket.IO integration
+    # ------------------------------------------------------------------
+    def attach_socketio(self, sio: SocketIO) -> None:
+        global socketio
+        socketio = sio
+
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+    def start_background_tasks(self, *, monitor_db: bool = True, run_scheduler: bool = True) -> None:
+        _stop_event.clear()
+        if run_scheduler:
+            self._start_thread(schedule_messages, name="schedule-loop")
+        if monitor_db:
+            self._start_thread(monitor_db_polling_general, name="db-monitor")
+
+    def stop_background_tasks(self, timeout: float = 2.0) -> None:
+        _stop_event.set()
+        for thread in list(self._threads):
+            try:
+                thread.join(timeout)
+            except Exception:
+                continue
+        self._threads.clear()
+
+    def _start_thread(self, target, name: str) -> None:
+        t = threading.Thread(target=target, name=name, daemon=True)
+        t.start()
+        self._threads.append(t)
+
+    # ------------------------------------------------------------------
+    # Proxy helpers to existing module-level functionality
+    # ------------------------------------------------------------------
+    def send_message(self, *, message: str, phone_number: Optional[str] = None, chat_guid: Optional[str] = None) -> None:
+        send_message(message=message, phone_number=phone_number, chat_guid=chat_guid)
+
+    def send_imessage(self, phone_number: str, message: str) -> None:
+        send_imessage(phone_number, message)
+
+    def schedule_message(self, time_str: str, phone: str, message: str) -> Dict[str, Any]:
+        phone_norm = normalize_phone(phone)
+        if not phone_norm:
+            raise ValueError("invalid phone")
+        return add_scheduled_message_entry(time_str, phone_norm, message)
+
+    def get_ai_settings(self) -> Dict[str, Any]:
+        return ai_settings
+
+    def update_ai_settings(self, updates: Dict[str, Any]) -> None:
+        ai_settings.update(updates)
+        save_ai_settings()
+
+    def set_allowed_users(self, handles: List[str]) -> None:
+        ai_settings["allowed_users"] = [normalize_handle(h) for h in handles if h]
+        save_ai_settings()
+
+    def get_message_log(self) -> List[Dict[str, Any]]:
+        return list(message_log)
+
+    def get_scheduled_messages(self) -> List[Dict[str, Any]]:
+        return list(scheduled_messages)
+
+    def remove_scheduled_message(self, entry_id: str) -> bool:
+        return remove_scheduled_message_entry(entry_id)
+
+    def check_db_reachability(self) -> Tuple[bool, Optional[str]]:
+        return check_db_reachability()
+
+    @property
+    def last_seen_date(self) -> int:
+        return last_seen_date

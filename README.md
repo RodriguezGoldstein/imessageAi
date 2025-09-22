@@ -25,7 +25,7 @@ This project is focused on privacy and explicit control: the agent never auto-re
 - Agent core: `services/agent.py` polls `~/Library/Messages/chat.db` for new messages and sends replies with AppleScript.
 - UI: `templates/dashboard.html` for live feed; `templates/settings.html` for trigger + allowlist management.
 - Data:
-  - `settings.json` – stores `ai_trigger_tag`, `openai_model`, `system_prompt`, `context_window`, and the allowlist (encrypted at rest).
+- `~/Library/Application Support/imessage-ai/config.json` – stores `ai_trigger_tag`, `openai_model`, `system_prompt`, `context_window`, and the allowlist (encrypted at rest).
 
 ## Requirements
 
@@ -89,19 +89,9 @@ PY
 
 4) Settings (auto-created if missing)
 
-`settings.json`
-
-```json
-{
-  "ai_trigger_tag": "@ai",
-  "openai_model": "gpt-4o-mini",
-  "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
-  "context_window": 25,
-  "allowed_users": ["+11234567890"]
-}
-```
-
-You can manage these from the Settings page or via the API.
+Runtime settings now persist under `~/Library/Application Support/imessage-ai/config.json`.
+The legacy `settings.json` file is migrated automatically on first launch. You can
+manage everything from the Settings page or via the API.
 
 ## Run
 
@@ -151,6 +141,12 @@ The agent replies in the same direct chat or group.
 - POST `/allowlist` (JSON) → update `ai_trigger_tag` and `allowed_users`
 - POST `/update_ai_settings` (form) → update `ai_trigger_tag`, `openai_model`, `system_prompt`, `allowed_users`
 - GET `/healthz` → `{ ok, db_ok, db_error, last_seen_date }`
+- GET `/api/messages` → `{ messages: [...] }`
+- GET `/api/schedule` → `{ scheduled: [...] }`
+- POST `/api/schedule` → schedule one or more numbers `{ time, message, phones: [] }`
+- DELETE `/api/schedule/<id>` → cancel a scheduled message
+- GET `/api/settings` → full AI settings payload
+- PATCH `/api/settings` → update AI settings via JSON
 
 Programmatic send:
 
@@ -185,6 +181,23 @@ curl -X POST http://127.0.0.1:5000/api/send \
   -d '{"chat_guid":"iMessage;+15555555555;12345","message":"Hello group"}'
 ```
 
+## Desktop UI (Svelte + NodeGUI)
+
+A native desktop shell lives under `desktop/` and mirrors the browser dashboard
+using Svelte rendered through NodeGUI. It spawns the Python backend locally and
+consumes the REST/Socket.IO APIs exposed by `app.py`.
+
+```bash
+cd desktop
+npm install
+npm run dev  # launches the desktop app and spawns python app.py
+```
+
+Before launching, ensure you have configured the backend, exported the required
+environment variables (`OPENAI_API_KEY`, `IMSG_AI_TOKEN`, `IMSG_AI_SECRET`), and
+run `make setup` so `.venv` exists. Build artifacts land in `desktop/dist/`; package
+them with `@nodegui/qode` or your preferred bundler to produce a `.app` bundle.
+
 ## Dashboard
 
 - Real-time list of received messages and bot replies (with [Group]/[Direct] indicator; group shows `chat_guid`).
@@ -201,13 +214,13 @@ curl -X POST http://127.0.0.1:5000/api/send \
 ## Model selection
 
 - Default in this repo: `gpt-4o-mini` for low-latency, low-cost replies.
-- You can set the model and system prompt in Settings or by editing `settings.json`.
+- You can set the model and system prompt in Settings or by editing `~/Library/Application Support/imessage-ai/config.json`.
 - If you prefer higher quality, set `openai_model` to `gpt-4o`.
 
 ## Context window
 
 - The agent includes recent conversation context when answering `@ai` requests.
-- Configure the number of recent messages with `context_window` (default 25, range 1–100) in Settings or `settings.json`.
+- Configure the number of recent messages with `context_window` (default 25, range 1–100) in Settings or `~/Library/Application Support/imessage-ai/config.json`.
 
 ## Service Setup (launchd)
 
@@ -250,7 +263,7 @@ If DB errors appear, grant Full Disk Access to your terminal/python and allow Au
 - Ensure Automation permission; otherwise AppleScript won’t send messages.
 - Persists `last_seen_date` under `~/Library/Application Support/imessage-ai/state.json` to avoid replaying history; set `BOT_REPLAY_HISTORY=1` to process existing messages.
 - Phone normalization: The app normalizes phones by stripping punctuation and a leading `tel:` prefix, preserving a leading `+` if present (e.g., `tel:+1 (555) 123-4567` → `+15551234567`). Email handles are lower‑cased.
-- Allowlist privacy: Phone numbers/emails in the allowlist are encrypted at rest in `settings.json`. A key is stored under `~/Library/Application Support/imessage-ai/secret.key`.
+- Allowlist privacy: Phone numbers/emails in the allowlist are encrypted at rest in `config.json`. A key is stored under `~/Library/Application Support/imessage-ai/secret.key`.
 
 ## macOS Permissions Helper
 
@@ -288,10 +301,12 @@ make macos-setup       # open permissions panes and prompt
 ```
 app.py                 # Flask app + Socket.IO setup
 services/agent.py      # Agent: DB polling, AppleScript sending, @ai processing
+services/config.py     # Centralized runtime configuration/state helpers
 templates/
   dashboard.html       # Live feed and controls
   settings.html        # Trigger + allowlist management
-settings.json          # Persisted agent settings
+~/Library/Application Support/imessage-ai/config.json  # Persisted agent settings
+desktop/               # Optional Svelte + NodeGUI desktop frontend
 ```
 
 ## Development Tips
