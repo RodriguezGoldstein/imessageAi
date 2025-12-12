@@ -4,13 +4,13 @@
     "system_prompt": "You are a concise, helpful assistant. Keep answers brief.",
     "context_window": 25,
     "allowed_users": [
-        "+13149287472"
+        "+1314314314"
     ],
     "allowed_users_encrypted": [
-        "gAAAAABowPMq2GEo1XWQKh09CiQJVkJVNFGYzfchssxb5TCaGLVu21nuCeSd-mOgbQSwNiOrHbtc1nlRhMzE4PptUbIJlUK6zg=="
+        "#######################"
     ],
     "enable_search": true,
-    "google_cse_id": "43a692e6bec084600",
+    "google_cse_id": "################",
     "search_max_results": 5,
     "search_cache_ttl": 120
 }
